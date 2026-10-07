@@ -1,0 +1,37 @@
+name: Test FIDO SELinux patch
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/patch_kernelsu_sepolicy_for_abk_fido.py
+      - tests/**
+      - .github/workflows/test-policy-patch.yml
+  pull_request:
+    paths:
+      - scripts/patch_kernelsu_sepolicy_for_abk_fido.py
+      - tests/**
+      - .github/workflows/test-policy-patch.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: '3.10'
+          - os: ubuntu-latest
+            python: '3.13'
+          - os: windows-latest
+            python: '3.13'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
