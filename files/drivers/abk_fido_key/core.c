@@ -419,8 +419,14 @@ struct abk_fido_usb {
 	struct usb_ep *out_ep;
 	struct usb_request *in_req;
 	struct usb_request *out_req[4];
+	/* UDC operations may invoke complete synchronously on error. Complete
+	 * never takes io_lock; all other nesting is io_lock -> tx_lock. */
+	spinlock_t io_lock;
 	spinlock_t tx_lock;
 	bool tx_pending;
+	int tx_status;
+	unsigned long out_ready;
+	int out_status[4];
 	bool online;
 	bool dead;
 	bool cancel_tx;
@@ -432,6 +438,7 @@ struct abk_fido_usb {
 	char udc_name[64];
 	struct work_struct rx_work;
 	struct work_struct tx_work;
+	struct work_struct out_work;
 	struct work_struct status_work;
 	struct abk_fido_queue rx_packets;
 	struct abk_fido_queue debug_rx;
@@ -4302,6 +4309,7 @@ static void abk_fido_tx_complete(struct usb_ep *ep, struct usb_request *req)
 
 	spin_lock_irqsave(&usb->tx_lock, flags);
 	usb->tx_pending = false;
+	usb->tx_status = req->status;
 	if (usb->online && !usb->dead)
 		schedule_work(&usb->tx_work);
 	spin_unlock_irqrestore(&usb->tx_lock, flags);
@@ -4317,14 +4325,13 @@ static void abk_fido_tx_worker(struct work_struct *work)
 	struct abk_fido_usb *usb = container_of(work, struct abk_fido_usb, tx_work);
 	struct abk_fido_report report;
 	struct usb_request *req;
-	unsigned long flags;
+	unsigned long flags, io_flags;
 	int ret;
 
+	spin_lock_irqsave(&usb->io_lock, io_flags);
 	spin_lock_irqsave(&usb->tx_lock, flags);
-	if (!usb->online || usb->dead || !usb->in_req) {
-		spin_unlock_irqrestore(&usb->tx_lock, flags);
-		return;
-	}
+	if (!usb->online || usb->dead || !usb->in_req)
+		goto out_state;
 	if (usb->cancel_tx && usb->tx_pending) {
 		usb->cancel_tx = false;
 		req = usb->in_req;
@@ -4334,38 +4341,100 @@ static void abk_fido_tx_worker(struct work_struct *work)
 		ret = usb_ep_dequeue(usb->in_ep, req);
 		if (ret && ret != -EINVAL && ret != -ESHUTDOWN)
 			pr_warn("abk_fido_key: dequeue IN request failed: %d\n", ret);
-		return;
+		goto out_io;
 	}
 	usb->cancel_tx = false;
-	if (usb->tx_pending) {
-		spin_unlock_irqrestore(&usb->tx_lock, flags);
-		return;
-	}
+	if (usb->tx_pending)
+		goto out_state;
 	do {
-		if (!abk_fido_queue_pop(&usb->tx_packets, &report)) {
-			spin_unlock_irqrestore(&usb->tx_lock, flags);
-			return;
-		}
+		if (!abk_fido_queue_pop(&usb->tx_packets, &report))
+			goto out_state;
 	} while (report.generation != usb->generation);
 	usb->tx_pending = true;
+	usb->tx_status = -EINPROGRESS;
 	memset(usb->in_req->buf, 0, ABK_FIDO_REPORT_LEN);
 	memcpy(usb->in_req->buf, report.data, report.len);
 	usb->in_req->length = ABK_FIDO_REPORT_LEN;
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
 	ret = usb_ep_queue(usb->in_ep, usb->in_req, GFP_ATOMIC);
+	spin_lock_irqsave(&usb->tx_lock, flags);
 	if (ret)
 		usb->tx_pending = false;
+	else if (usb->tx_status < 0 && usb->tx_status != -EINPROGRESS)
+		ret = usb->tx_status;
 	spin_unlock_irqrestore(&usb->tx_lock, flags);
 	if (ret)
 		pr_warn("abk_fido_key: failed to queue IN response: %d\n", ret);
+	goto out_io;
+out_state:
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
+out_io:
+	spin_unlock_irqrestore(&usb->io_lock, io_flags);
+}
+
+/* Caller holds io_lock, but never tx_lock across an operation that can
+ * synchronously give back this (or another cancelled) request. */
+static int abk_fido_queue_out(struct abk_fido_usb *usb, unsigned int index)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&usb->tx_lock, flags);
+	if (!usb->online || usb->dead) {
+		spin_unlock_irqrestore(&usb->tx_lock, flags);
+		return -ESHUTDOWN;
+	}
+	usb->out_status[index] = -EINPROGRESS;
+	usb->out_req[index]->actual = 0;
+	usb->out_req[index]->length = ABK_FIDO_REPORT_LEN;
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
+	ret = usb_ep_queue(usb->out_ep, usb->out_req[index], GFP_ATOMIC);
+	spin_lock_irqsave(&usb->tx_lock, flags);
+	if (ret)
+		usb->out_status[index] = ret;
+	else if (usb->out_status[index] < 0 &&
+		 usb->out_status[index] != -EINPROGRESS)
+		ret = usb->out_status[index];
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
+	return ret;
+}
+
+static void abk_fido_out_worker(struct work_struct *work)
+{
+	struct abk_fido_usb *usb = container_of(work, struct abk_fido_usb, out_work);
+	unsigned long flags, io_flags, ready;
+	unsigned int i;
+	int ret;
+
+	spin_lock_irqsave(&usb->io_lock, io_flags);
+	spin_lock_irqsave(&usb->tx_lock, flags);
+	ready = usb->online && !usb->dead ? usb->out_ready : 0;
+	usb->out_ready = 0;
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
+	/* One attempt per completion; failures are never put back on ready. */
+	for (i = 0; i < ARRAY_SIZE(usb->out_req); i++) {
+		if (!(ready & BIT(i)))
+			continue;
+		ret = abk_fido_queue_out(usb, i);
+		if (ret)
+			pr_warn("abk_fido_key: failed to requeue OUT request: %d\n", ret);
+	}
+	spin_unlock_irqrestore(&usb->io_lock, io_flags);
 }
 
 static void abk_fido_out_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	struct abk_fido_usb *usb = req->context;
 	unsigned long flags;
-	int ret;
+	unsigned int i;
 
 	spin_lock_irqsave(&usb->tx_lock, flags);
+	for (i = 0; i < ARRAY_SIZE(usb->out_req); i++) {
+		if (usb->out_req[i] == req) {
+			usb->out_status[i] = req->status;
+			break;
+		}
+	}
 	if (!usb->online || usb->dead || req->status) {
 		spin_unlock_irqrestore(&usb->tx_lock, flags);
 		return;
@@ -4378,11 +4447,11 @@ static void abk_fido_out_complete(struct usb_ep *ep, struct usb_request *req)
 	}
 
 	req->actual = 0;
-	req->length = ABK_FIDO_REPORT_LEN;
-	ret = usb_ep_queue(ep, req, GFP_ATOMIC);
+	if (i < ARRAY_SIZE(usb->out_req)) {
+		usb->out_ready |= BIT(i);
+		schedule_work(&usb->out_work);
+	}
 	spin_unlock_irqrestore(&usb->tx_lock, flags);
-	if (ret)
-		pr_warn("abk_fido_key: failed to requeue out request: %d\n", ret);
 }
 
 struct abk_fido_file {
@@ -4701,9 +4770,9 @@ static void abk_fido_release_endpoints(struct abk_fido_usb *usb)
 	}
 }
 
-static void abk_fido_disable(struct usb_function *f)
+/* io_lock serializes submissions with disconnect and reconfiguration. */
+static void abk_fido_disable_io_locked(struct abk_fido_usb *usb)
 {
-	struct abk_fido_usb *usb = container_of(f, struct abk_fido_usb, func);
 	struct abk_fido_report stale;
 	unsigned long flags;
 
@@ -4712,6 +4781,7 @@ static void abk_fido_disable(struct usb_function *f)
 	WRITE_ONCE(usb->online, false);
 	WRITE_ONCE(usb->generation, usb->generation + 1);
 	usb->cancel_tx = false;
+	usb->out_ready = 0;
 	spin_unlock_irqrestore(&usb->tx_lock, flags);
 	wake_up_interruptible(&abk_fido_dev.auth_wait);
 	if (usb->in_ep)
@@ -4721,6 +4791,8 @@ static void abk_fido_disable(struct usb_function *f)
 
 	spin_lock_irqsave(&usb->tx_lock, flags);
 	usb->tx_pending = false;
+	usb->tx_status = -ESHUTDOWN;
+	usb->out_ready = 0;
 
 	/* Drop responses queued for the session that just died: they carry
 	 * stale request state and would poison the next enumeration.
@@ -4736,24 +4808,37 @@ static void abk_fido_disable(struct usb_function *f)
 	wake_up_interruptible(&usb->debug_rx.wait);
 }
 
+static void abk_fido_disable(struct usb_function *f)
+{
+	struct abk_fido_usb *usb = container_of(f, struct abk_fido_usb, func);
+	unsigned long flags;
+
+	spin_lock_irqsave(&usb->io_lock, flags);
+	abk_fido_disable_io_locked(usb);
+	spin_unlock_irqrestore(&usb->io_lock, flags);
+}
+
 static int abk_fido_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 {
 	struct abk_fido_usb *usb = container_of(f, struct abk_fido_usb, func);
 	struct usb_composite_dev *cdev = f->config->cdev;
-	unsigned long flags;
+	unsigned long flags, io_flags;
 	unsigned int i;
 	int ret;
 
-	abk_fido_disable(f);
-	if (READ_ONCE(usb->dead))
-		return -ESHUTDOWN;
+	spin_lock_irqsave(&usb->io_lock, io_flags);
+	abk_fido_disable_io_locked(usb);
+	if (READ_ONCE(usb->dead)) {
+		ret = -ESHUTDOWN;
+		goto out_io;
+	}
 
 	ret = config_ep_by_speed(cdev->gadget, f, usb->in_ep);
 	if (ret)
-		return ret;
+		goto out_io;
 	ret = usb_ep_enable(usb->in_ep);
 	if (ret)
-		return ret;
+		goto out_io;
 	usb->in_ep->driver_data = usb;
 
 	ret = config_ep_by_speed(cdev->gadget, f, usb->out_ep);
@@ -4767,27 +4852,30 @@ static int abk_fido_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 	spin_lock_irqsave(&usb->tx_lock, flags);
 	WRITE_ONCE(usb->online, true);
 	usb->tx_pending = false;
+	usb->out_ready = 0;
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
 	for (i = 0; i < ARRAY_SIZE(usb->out_req); i++) {
-		usb->out_req[i]->length = ABK_FIDO_REPORT_LEN;
-		ret = usb_ep_queue(usb->out_ep, usb->out_req[i], GFP_ATOMIC);
-		if (ret) {
-			spin_unlock_irqrestore(&usb->tx_lock, flags);
+		ret = abk_fido_queue_out(usb, i);
+		if (ret)
 			goto err_out;
-		}
 	}
 
+	spin_lock_irqsave(&usb->tx_lock, flags);
 	usb->protocol = HID_REPORT_PROTOCOL;
 	usb->idle = 0;
 	schedule_work(&usb->status_work);
 	abk_fido_tx_kick(usb);
 	spin_unlock_irqrestore(&usb->tx_lock, flags);
-	return 0;
+	ret = 0;
+	goto out_io;
 
 err_out:
-	abk_fido_disable(f);
-	return ret;
+	abk_fido_disable_io_locked(usb);
+	goto out_io;
 err_in:
 	usb_ep_disable(usb->in_ep);
+out_io:
+	spin_unlock_irqrestore(&usb->io_lock, io_flags);
 	return ret;
 }
 
@@ -4806,6 +4894,7 @@ static void abk_fido_quiesce(struct abk_fido_usb *usb)
 		usb->misc_registered = false;
 	}
 	cancel_work_sync(&usb->rx_work);
+	cancel_work_sync(&usb->out_work);
 	cancel_work_sync(&usb->tx_work);
 	cancel_work_sync(&usb->status_work);
 	mutex_lock(&abk_fido_dev.lock);
@@ -4989,9 +5078,11 @@ static struct usb_function *abk_fido_alloc(struct usb_function_instance *fi)
 
 	kref_init(&usb->ref);
 	usb->dead = true;
+	spin_lock_init(&usb->io_lock);
 	spin_lock_init(&usb->tx_lock);
 	INIT_WORK(&usb->rx_work, abk_fido_rx_worker);
 	INIT_WORK(&usb->tx_work, abk_fido_tx_worker);
+	INIT_WORK(&usb->out_work, abk_fido_out_worker);
 	INIT_WORK(&usb->status_work, abk_fido_status_worker);
 	abk_fido_queue_init(&usb->rx_packets);
 	abk_fido_queue_init(&usb->debug_rx);

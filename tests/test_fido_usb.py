@@ -15,7 +15,7 @@ CORE = ROOT / 'files/drivers/abk_fido_key/core.c'
 
 
 class UsbLifetimeTests(unittest.TestCase):
-    def test_atomic_callbacks_reset_epochs_and_open_file_lifetime(self):
+    def test_inline_givebacks_lock_order_epochs_and_open_file_lifetime(self):
         compiler = shlex.split(os.environ.get('CC', ''))
         if not compiler:
             compiler = [path for name in ('cc', 'clang', 'gcc')
@@ -41,6 +41,7 @@ class UsbLifetimeTests(unittest.TestCase):
             '/* USB_FILE */': between('struct abk_fido_file {', 'static ssize_t abk_fido_misc_read('),
             '/* USB_FREE */': between('static void abk_fido_free_requests(', 'static void abk_fido_disable('),
             '/* USB_CALLBACKS */': between('static void abk_fido_disable(', 'static void abk_fido_quiesce('),
+            '/* USB_QUIESCE */': between('static void abk_fido_quiesce(', 'static void abk_fido_free_func('),
         }
         harness = (ROOT / 'tests/fixtures/fido_usb_harness.c').read_text(encoding='utf-8')
         for marker, implementation in parts.items():
@@ -55,7 +56,7 @@ class UsbLifetimeTests(unittest.TestCase):
                 capture_output=True, text=True,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = subprocess.run([str(executable)], capture_output=True, text=True)
+            result = subprocess.run([str(executable)], capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
