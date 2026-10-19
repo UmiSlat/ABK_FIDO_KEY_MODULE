@@ -186,9 +186,22 @@ jobs:
           gradle-version: "9.5.1"
 
       - name: Test and build debug APK
+        id: debug
         run: gradle --no-daemon testDebugUnitTest assembleDebug
 
+      - name: Build unsigned release APK for build validation
+        id: unsigned
+        run: |
+          set -euo pipefail
+          gradle --no-daemon assembleRelease
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/*-unsigned.apk)
+          test "${#apks[@]}" -eq 1
+          mkdir -p dist
+          cp "${apks[0]}" dist/abk-fido-companion-release-unsigned.apk
+
       - name: Prepare release signing
+        id: signing
         if: >-
           (github.event_name == 'workflow_dispatch' && inputs.sign_release) ||
           (github.event_name == 'push' && github.repository == 'UmiSlat/ABK_FIDO_KEY_MODULE' && github.ref == 'refs/heads/feat/userspace-fido')
@@ -197,14 +210,24 @@ jobs:
           ANDROID_SIGNING_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEYSTORE_PASSWORD }}
           ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
           ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+          REQUIRE_RELEASE_SIGNING: ${{ github.event_name == 'workflow_dispatch' && inputs.sign_release }}
         run: |
           set -euo pipefail
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          missing=()
           for secret_name in ANDROID_SIGNING_KEYSTORE_BASE64 ANDROID_SIGNING_KEYSTORE_PASSWORD ANDROID_SIGNING_KEY_ALIAS ANDROID_SIGNING_KEY_PASSWORD; do
             if [ -z "${!secret_name}" ]; then
-              echo "Missing required signing secret: $secret_name" >&2
-              exit 1
+              missing+=("$secret_name")
             fi
           done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            if [ "$REQUIRE_RELEASE_SIGNING" = true ]; then
+              echo "::error::sign_release=true requires repository signing secrets. Missing: ${missing[*]}"
+              exit 1
+            fi
+            echo "::warning::Skipping optional release signing; repository signing secrets are missing: ${missing[*]}. Debug and unsigned release build artifacts remain available."
+            exit 0
+          fi
           umask 077
           mkdir -p "$RUNNER_TEMP/android-signing"
           printf '%s' "$ANDROID_SIGNING_KEYSTORE_BASE64" | tr -d '\r\n' | \
@@ -212,11 +235,10 @@ jobs:
           keytool -list -keystore "$RUNNER_TEMP/android-signing/release.jks" \
             -storepass:env ANDROID_SIGNING_KEYSTORE_PASSWORD \
             -alias "$ANDROID_SIGNING_KEY_ALIAS" >/dev/null
+          echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: Build signed release APK
-        if: >-
-          (github.event_name == 'workflow_dispatch' && inputs.sign_release) ||
-          (github.event_name == 'push' && github.repository == 'UmiSlat/ABK_FIDO_KEY_MODULE' && github.ref == 'refs/heads/feat/userspace-fido')
+        if: success() && steps.signing.outputs.available == 'true'
         env:
           ANDROID_SIGNING_STORE_FILE: ${{ runner.temp }}/android-signing/release.jks
           ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEYSTORE_PASSWORD }}
@@ -225,9 +247,7 @@ jobs:
         run: gradle --no-daemon assembleRelease
 
       - name: Verify release signature
-        if: >-
-          (github.event_name == 'workflow_dispatch' && inputs.sign_release) ||
-          (github.event_name == 'push' && github.repository == 'UmiSlat/ABK_FIDO_KEY_MODULE' && github.ref == 'refs/heads/feat/userspace-fido')
+        if: success() && steps.signing.outputs.available == 'true'
         run: |
           set -euo pipefail
           apksigner="$(find "$ANDROID_HOME/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)"
@@ -242,16 +262,23 @@ jobs:
         run: rm -rf -- "$RUNNER_TEMP/android-signing"
 
       - name: Upload debug APK
+        if: always() && steps.debug.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: abk-fido-companion-debug
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
+      - name: Upload unsigned release build only (not an installation package)
+        if: always() && steps.unsigned.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: abk-fido-companion-release-unsigned-build-only
+          path: dist/abk-fido-companion-release-unsigned.apk
+          if-no-files-found: error
+
       - name: Upload signed release APK
-        if: >-
-          (github.event_name == 'workflow_dispatch' && inputs.sign_release) ||
-          (github.event_name == 'push' && github.repository == 'UmiSlat/ABK_FIDO_KEY_MODULE' && github.ref == 'refs/heads/feat/userspace-fido')
+        if: success() && steps.signing.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: abk-fido-companion-release

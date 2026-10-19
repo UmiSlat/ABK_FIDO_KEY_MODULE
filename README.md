@@ -76,6 +76,12 @@ Build Companion with `gradle :app:assembleDebug` for local testing, or provide
 the existing release-signing environment variables for `:app:assembleRelease`.
 An APK can update an installed app only when signed by the same signing key.
 The standalone workflow uploads build artifacts without publishing a release.
+Release signing uses the repository's existing `ANDROID_SIGNING_*` secrets
+when configured. Without them, CI still tests/builds debug and unsigned release
+APKs; an unsigned APK must be signed before installation. A separately signed
+preview APK cannot be assumed to update an existing installation. Export an
+encrypted key backup before any app reinstall. Debug APKs are for development,
+not long-term key storage; use a non-debuggable release build on a real device.
 
 The new engine implements ES256 packed self-attestation, discoverable
 credentials, make/get/getNextAssertion, reset, selection and protocol-1
