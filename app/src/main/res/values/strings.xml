@@ -21,7 +21,7 @@
     <string name="main_title">FIDO KEY</string>
     <string name="main_subtitle">AnyBase Kernel</string>
     <string name="master_switch_title">Use FIDO keys</string>
-    <string name="status_driver_missing">The abk_fido_key driver is not loaded.</string>
+    <string name="status_driver_missing">The FIDO service is unavailable.</string>
     <string name="status_root_unavailable">Root access was denied. Key management needs root.</string>
     <string name="status_keys">%1$d of %2$d slots used</string>
     <string name="status_host_connected">Connected to a USB host</string>
@@ -128,7 +128,7 @@
     <string name="lan_client_at_address">Computer at %1$s</string>
 
     <!-- Credential Manager provider -->
-    <string name="provider_entry_description">ABK kernel FIDO authenticator</string>
+    <string name="provider_entry_description">ABK FIDO authenticator</string>
     <string name="provider_get_failed">FIDO request failed</string>
     <string name="provider_create_failed">FIDO creation failed</string>
     <string name="provider_request_missing">Missing Credential Manager request</string>

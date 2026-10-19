@@ -1,0 +1,6 @@
+id=abk_fido_userspace
+name=ABK FIDO Userspace
+version=0.4.0
+versionCode=3
+author=ABK contributors
+description=USB FIDO authenticator using standard HID gadget and a userspace daemon. Keys live under /data/adb/abk-fido; validated legacy metadata keys are imported once and preserved. Requires arm64, KernelSU root, and Companion 0.4.0 (versionCode 3) or newer for approval. No custom kernel module.

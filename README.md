@@ -1,5 +1,96 @@
 # ABK FIDO Key Module
 
+## Standalone userspace edition / 独立用户态版
+
+The `feat/userspace-fido` branch adds a standalone authenticator. It uses the
+kernel's **standard USB HID gadget**, a static arm64 Go daemon, and the existing
+Android Companion. No ABK-specific kernel patch, bridge, or `.ko` is required.
+The kernel integration documented below remains available as a legacy backend.
+
+此版本将 CTAP 协议、签名、凭据持久化及授权协作移到用户态，通过 KernelSU
+模块安装。以后更新模块和配套应用即可，无须为 FIDO 重刷 boot。它仍需内核
+已有标准 USB HID/configfs 支持，并非适用于所有已经 root 的手机。
+
+### Migration / 首次迁移
+
+1. Export an encrypted backup with the existing Companion. Keep it off the phone.
+   Preserve `/metadata/abk_fido_store.bin`; do not clear or replace it with an
+   empty file. On first start, the daemon imports it into
+   `/data/adb/abk-fido/store.bin` only if the new store is absent. It keeps the
+   old file as a migration backup and never automatically imports it over a
+   newer store. The daemon reads the existing v1/v2 format, validates CRC and
+   P-256 keys, and preserves credential IDs, user handles, keys, AAGUID and counter.
+2. Boot a known working kernel **without the old builtin ABK FIDO driver**. The
+   module refuses to run if `/sys/kernel/abk_fido_key` exists. Existing builtin
+   FIDO cannot be unloaded by a normal KernelSU module.
+3. Update Companion to **0.4.0 / versionCode 3 or newer**. Update or uninstall
+   every older release/debug variant: those versions write the store directly.
+   The new Companion uses root-only transactions and keeps SQLite as a mirror
+   under `/data/adb/abk-fido/`, so other devices need no `/metadata` partition.
+4. Install `abk-fido-userspace-arm64.zip` through KernelSU, then reboot. The
+   service starts after Android finishes booting. Open Companion and grant root
+   and its normal biometric/screen-lock permissions. Requests are denied or time
+   out when the Companion cannot approve them; there is no automatic approval.
+5. Test a new credential on a test account before relying on migrated keys.
+   Windows should enumerate a FIDO HID interface. If a phone-wide vendor ADB
+   driver prevents composite enumeration, select **File transfer / Android Auto**
+   and reconnect. USB reconfiguration briefly interrupts ADB and file transfer.
+
+首次需要退出旧的内置 FIDO 内核。此后模块可独立更新；内核或 ROM 的 OTA
+只要继续提供所需标准 USB 接口和 root，通常无须重新编译本服务。真实机型上的
+USB HAL、SELinux、注册/登录、备份恢复仍需验证，不承诺未经测试的机型兼容。
+
+### Requirements / 运行条件
+
+- Android arm64 with KernelSU-compatible module scripts and root access.
+- USB device/peripheral mode, configfs gadget, and `USB_CONFIGFS_F_HID` enabled
+  (or its standard module already loaded), with interrupt IN/OUT endpoints.
+- Root may read/write the existing gadget configuration and open `/dev/hidgN`.
+  SELinux stays enforcing; this package does not add a permissive policy.
+- One active gadget with one native USB configuration. Ambiguous layouts and
+  unsupported environments are reported rather than guessed.
+- Companion 0.4.0+ for mandatory local approval. Android Credential Manager
+  provider integration remains Android 14+; USB use does not require Android 14.
+
+The service preserves native USB functions and VID/PID, watches HAL mode
+changes, and adds only its own HID link. A bind failure rolls back that link
+and restores the original UDC binding. Stop detaches the same link; uninstall
+preserves credentials. A userspace crash stops authentication and does not
+automatically restart in a loop. Standard kernel drivers remain part of the
+USB path, so this does not guarantee freedom from kernel or USB faults.
+
+### Build / 构建
+
+Go 1.23+ and Python 3.10+ are sufficient for the daemon/package. No Android NDK
+or matching kernel build tree is required. From the repository root on Linux:
+
+```sh
+cd daemon
+go test -race ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o ../dist/abk-fidod ./cmd/abk-fidod
+cd ..
+python3 scripts/package_userspace.py --binary dist/abk-fidod --output dist/abk-fido-userspace-arm64.zip
+```
+
+Build Companion with `gradle :app:assembleDebug` for local testing, or provide
+the existing release-signing environment variables for `:app:assembleRelease`.
+An APK can update an installed app only when signed by the same signing key.
+The standalone workflow uploads build artifacts without publishing a release.
+
+The new engine implements ES256 packed self-attestation, discoverable
+credentials, make/get/getNextAssertion, reset, selection and protocol-1
+`hmac-secret` (including independent key agreement and one/two salts). It does
+not advertise client PIN, U2F, protocol 2, PRF-on-create, large blobs or credential
+management commands. Existing Companion encrypted archives and LAN relay are
+retained; its Android provider does not claim WebAuthn PRF extension support.
+
+Logs: `/data/adb/abk-fido/service.log`. The KernelSU Action button starts/stops
+the service. The control socket is root-only, under the private runtime directory.
+See [module operation details](kernelsu/README.md) and
+[daemon protocol](daemon/README.md).
+
+## Legacy kernel integration / 原内核集成方式
+
 `abk_fido_key_module` is an ABK custom external kernel module that turns an
 Android phone build into a composite USB FIDO2 security key.
 

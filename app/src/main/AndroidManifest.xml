@@ -69,7 +69,7 @@
             android:excludeFromRecents="true"
             android:exported="true"
             android:finishOnTaskLaunch="true"
-            android:launchMode="singleInstance"
+            android:launchMode="standard"
             android:theme="@style/Theme.AbkFido.Translucent" />
 
         <activity

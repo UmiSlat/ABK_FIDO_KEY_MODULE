@@ -21,7 +21,7 @@
     <string name="main_title">FIDO 密钥</string>
     <string name="main_subtitle">AnyBase Kernel</string>
     <string name="master_switch_title">启用 FIDO 密钥</string>
-    <string name="status_driver_missing">未加载 abk_fido_key 驱动。</string>
+    <string name="status_driver_missing">FIDO 服务不可用。</string>
     <string name="status_root_unavailable">Root 权限被拒绝，管理密钥需要 Root。</string>
     <string name="status_keys">已使用 %1$d / %2$d 个槽位</string>
     <string name="status_host_connected">已连接到 USB 主机</string>
@@ -128,7 +128,7 @@
     <string name="lan_client_at_address">位于 %1$s 的电脑</string>
 
     <!-- 凭据管理器提供方 -->
-    <string name="provider_entry_description">ABK 内核 FIDO 认证器</string>
+    <string name="provider_entry_description">ABK FIDO 认证器</string>
     <string name="provider_get_failed">FIDO 请求失败</string>
     <string name="provider_create_failed">创建 FIDO 密钥失败</string>
     <string name="provider_request_missing">缺少凭据管理器请求</string>

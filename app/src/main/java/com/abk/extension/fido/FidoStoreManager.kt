@@ -23,8 +23,20 @@ internal sealed class StoreEditResult {
  */
 internal object FidoStoreManager {
 
+    private data class ReadState(val blob: FidoStoreBlob, val snapshot: FidoDaemonBridge.Snapshot?)
+
+    private fun readState(): ReadState? {
+        if (FidoDaemonBridge.isInstalled()) {
+            val snapshot = FidoDaemonBridge.snapshot() ?: return null
+            return ReadState(snapshot.blob, snapshot)
+        }
+        return readLegacy()?.let { ReadState(it, null) }
+    }
+
     /** Read the persisted store. Returns null when root or the file is missing. */
-    fun read(): FidoStoreBlob? {
+    fun read(): FidoStoreBlob? = readState()?.blob
+
+    private fun readLegacy(): FidoStoreBlob? {
         val result = RootShell.readFileBase64(STORE_PATH)
         if (!result.success) {
             Log.w(TAG, "read $STORE_PATH failed exit=${result.exitCode} out=${result.stdout}")
@@ -38,10 +50,11 @@ internal object FidoStoreManager {
     }
 
     fun delete(slot: Int): StoreEditResult {
-        val store = read() ?: return StoreEditResult.Failure("cannot read the FIDO store")
+        val state = readState() ?: return StoreEditResult.Failure("cannot read the FIDO store")
+        val store = state.blob
         val record = store.credentialAt(slot)
             ?: return StoreEditResult.Failure("that key is no longer in the store")
-        return commit(store.withoutSlot(slot)).also {
+        return commit(store.withoutSlot(slot), state.snapshot).also {
             if (it is StoreEditResult.Success) {
                 Log.i(TAG, "deleted slot=$slot rp=${record.rpId}")
             }
@@ -49,10 +62,11 @@ internal object FidoStoreManager {
     }
 
     fun rename(slot: Int, userName: String, userDisplay: String): StoreEditResult {
-        val store = read() ?: return StoreEditResult.Failure("cannot read the FIDO store")
+        val state = readState() ?: return StoreEditResult.Failure("cannot read the FIDO store")
+        val store = state.blob
         store.credentialAt(slot)
             ?: return StoreEditResult.Failure("that key is no longer in the store")
-        return commit(store.withRenamedSlot(slot, userName, userDisplay))
+        return commit(store.withRenamedSlot(slot, userName, userDisplay), state.snapshot)
     }
 
     /**
@@ -61,11 +75,12 @@ internal object FidoStoreManager {
      * assertions by credential id and two identical ids would be ambiguous.
      */
     fun import(records: List<FidoCredentialRecord>): ImportOutcome {
-        val store = read() ?: return ImportOutcome(
+        val state = readState() ?: return ImportOutcome(
             result = StoreEditResult.Failure("cannot read the FIDO store"),
             imported = 0,
             skipped = 0,
         )
+        val store = state.blob
         val existing = store.credentials().map { it.credIdHex }.toMutableSet()
         var next = store
         var imported = 0
@@ -79,9 +94,9 @@ internal object FidoStoreManager {
             if (updated == null) {
                 return ImportOutcome(
                     result = StoreEditResult.Failure(
-                        "the store is full at ${FidoStoreBlob.MAX_CREDS} keys; $imported imported before that"
+                        "the store is full at ${FidoStoreBlob.MAX_CREDS} keys; no keys were imported"
                     ),
-                    imported = imported,
+                    imported = 0,
                     skipped = skipped,
                 )
             }
@@ -91,7 +106,8 @@ internal object FidoStoreManager {
         if (imported == 0) {
             return ImportOutcome(StoreEditResult.Success, imported = 0, skipped = skipped)
         }
-        return ImportOutcome(commit(next), imported = imported, skipped = skipped)
+        val result = commit(next, state.snapshot)
+        return ImportOutcome(result, imported = if (result is StoreEditResult.Success) imported else 0, skipped = skipped)
     }
 
     class ImportOutcome(val result: StoreEditResult, val imported: Int, val skipped: Int)
@@ -101,7 +117,15 @@ internal object FidoStoreManager {
      * bumps `store_generation` on success, which is the only unambiguous signal
      * that the new contents are live.
      */
-    private fun commit(store: FidoStoreBlob): StoreEditResult {
+    private fun commit(store: FidoStoreBlob, snapshot: FidoDaemonBridge.Snapshot?): StoreEditResult {
+        if (snapshot != null) {
+            val result = FidoDaemonBridge.replace(store, snapshot)
+            return if (result.success) StoreEditResult.Success
+            else StoreEditResult.Failure("FIDO service rejected the edit: ${result.stdout.trim()}")
+        }
+        // Do not fall back to a raw file write if a module was installed after
+        // the legacy snapshot was read. The caller must start a fresh edit.
+        if (FidoDaemonBridge.isInstalled()) return StoreEditResult.Failure("FIDO backend changed; retry the edit")
         val bytes = store.toBytes()
         val generationBefore = FidoKernelBridge.readStoreGeneration()
             ?: return StoreEditResult.Failure("the abk_fido_key driver is not loaded")

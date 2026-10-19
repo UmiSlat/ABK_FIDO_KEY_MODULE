@@ -144,10 +144,11 @@ internal object RootShell {
             """
             src=${shellQuote(srcPath)}
             dst=${shellQuote(dstPath)}
-            [ -f "${'$'}src" ] || exit 3
-            cp -f "${'$'}src" "${'$'}dst"
-            chmod 0600 "${'$'}dst" 2>/dev/null || true
-            restorecon "${'$'}dst" 2>/dev/null || true
+            if [ -f "${'$'}src" ] && cp -f "${'$'}src" "${'$'}dst"; then
+                chmod 0600 "${'$'}dst" && (restorecon "${'$'}dst" 2>/dev/null || true)
+            else
+                false
+            fi
             """.trimIndent()
         )
     }
@@ -157,10 +158,11 @@ internal object RootShell {
             """
             src=${shellQuote(srcPath)}
             dst=${shellQuote(dstPath)}
-            [ -f "${'$'}src" ] || exit 3
-            cp -f "${'$'}src" "${'$'}dst"
-            chown ${ownerUid}:${ownerUid} "${'$'}dst" 2>/dev/null || true
-            chmod 0600 "${'$'}dst" 2>/dev/null || true
+            if [ -f "${'$'}src" ] && cp -f "${'$'}src" "${'$'}dst"; then
+                chown ${ownerUid}:${ownerUid} "${'$'}dst" && chmod 0600 "${'$'}dst"
+            else
+                false
+            fi
             """.trimIndent()
         )
     }

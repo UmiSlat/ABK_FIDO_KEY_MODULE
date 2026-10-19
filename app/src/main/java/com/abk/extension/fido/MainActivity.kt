@@ -584,7 +584,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private companion object {
-        const val PAIRING_CODE_PATH = "/metadata/abk_fido_pairing_code"
+        val PAIRING_CODE_PATH: String get() = FidoStoragePaths.pairingCode
         const val MIN_PASSPHRASE = 8
     }
 }

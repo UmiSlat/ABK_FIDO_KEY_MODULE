@@ -1,0 +1,4 @@
+# The daemon runs in the existing KernelSU root domain, not the kernel domain.
+# No permissive domain or guessed device-specific SELinux types are installed.
+# If this ROM reports an AVC denial, add only a rule for its actual source,
+# target, class and denied operation after reviewing the captured denial.

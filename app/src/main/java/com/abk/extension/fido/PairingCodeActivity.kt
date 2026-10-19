@@ -16,7 +16,7 @@ class PairingCodeActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val code = RootShell.readTextFile("/metadata/abk_fido_pairing_code").stdout.trim()
+        val code = FidoStoragePaths.readPairingCode()
         val codeView = TextView(this).apply {
             text = code.ifBlank { getString(R.string.pairing_code_none) }
             textSize = 32f

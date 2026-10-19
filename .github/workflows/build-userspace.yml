@@ -1,0 +1,269 @@
+name: Build userspace FIDO
+
+on:
+  push:
+    paths:
+      - "daemon/**"
+      - "kernelsu/**"
+      - "app/**"
+      - "scripts/package_userspace.py"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - ".github/workflows/build-userspace.yml"
+  pull_request:
+    paths:
+      - "daemon/**"
+      - "kernelsu/**"
+      - "app/**"
+      - "scripts/package_userspace.py"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - ".github/workflows/build-userspace.yml"
+  workflow_dispatch:
+    inputs:
+      sign_release:
+        description: "Also build a release APK with the existing Android signing key"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  daemon:
+    name: Test and package arm64 daemon
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.2"
+          cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install independent FIDO client
+        run: python -m pip install --disable-pip-version-check -r daemon/integration/requirements.txt
+
+      - name: Run race tests and vet
+        working-directory: daemon
+        run: |
+          set -euo pipefail
+          mkdir -p ../dist
+          go test -race ./... 2>&1 | tee ../dist/go-test.txt
+          go vet ./... 2>&1 | tee ../dist/go-vet.txt
+
+      - name: Test independent host interoperability
+        working-directory: daemon
+        run: |
+          set -euo pipefail
+          host_binary="$RUNNER_TEMP/abk-fidod-host"
+          go build -trimpath -buildvcs=false -o "$host_binary" ./cmd/abk-fidod
+          python_exe="$(command -v python)"
+          state_dir="$(sudo -n mktemp -d "$RUNNER_TEMP/abk-fido-interop.XXXXXX")"
+          launcher_pid=""
+          cleanup() {
+            if sudo -n test -f "$state_dir/daemon.pid"; then
+              daemon_pid="$(sudo -n cat "$state_dir/daemon.pid")"
+              sudo -n kill -TERM "$daemon_pid" 2>/dev/null || true
+            fi
+            if [ -n "$launcher_pid" ]; then
+              wait "$launcher_pid" || true
+            fi
+            # The randomly created directory contains only this test's store.
+            sudo -n rm -rf -- "$state_dir"
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          sudo -n bash -c '
+            printf "%s\n" "$$" > "$1/daemon.pid"
+            exec "$2" serve --no-usb --state-dir "$1" \
+              --store "$1/store.bin" --legacy-store "$1/nonexistent-legacy.bin"
+          ' _ "$state_dir" "$host_binary" > ../dist/interop-daemon.log 2>&1 &
+          launcher_pid=$!
+          ready=false
+          for attempt in {1..100}; do
+            if sudo -n test -S "$state_dir/control.sock"; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$launcher_pid" 2>/dev/null; then
+              cat ../dist/interop-daemon.log
+              exit 1
+            fi
+            sleep 0.1
+          done
+          if [ "$ready" != true ]; then
+            cat ../dist/interop-daemon.log
+            echo "Isolated daemon did not become ready" >&2
+            exit 1
+          fi
+          # Both the service and its test client use root; production UID checks
+          # and explicit request-ID approvals remain enabled throughout.
+          sudo -n "$python_exe" integration/interop.py \
+            --socket "$state_dir/control.sock" --approve-test-requests \
+            --report "$GITHUB_WORKSPACE/dist/interop.json" \
+            2>&1 | tee ../dist/interop.txt
+
+      - name: Build static arm64 daemon and module ZIP
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          set -euo pipefail
+          (
+            cd daemon
+            go build -trimpath -buildvcs=false \
+              -ldflags="-s -w -X main.version=0.4.0-${GITHUB_SHA:0:12}" \
+              -o ../dist/abk-fidod ./cmd/abk-fidod
+          )
+          python scripts/package_userspace.py \
+            --binary dist/abk-fidod --output dist/abk-fido-userspace-arm64.zip
+          (cd dist && sha256sum abk-fido-userspace-arm64.zip > SHA256SUMS)
+
+      - name: Upload userspace module
+        uses: actions/upload-artifact@v4
+        with:
+          name: abk-fido-userspace-arm64
+          path: |
+            dist/abk-fido-userspace-arm64.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Upload daemon test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: abk-fido-userspace-test-reports
+          path: |
+            dist/go-test.txt
+            dist/go-vet.txt
+            dist/interop.json
+            dist/interop.txt
+            dist/interop-daemon.log
+          if-no-files-found: ignore
+
+  companion:
+    name: Test and build Android companion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # AGP installs the requested platform/build-tools; avoid the removed
+          # legacy `tools` package from this action's default package list.
+          packages: platform-tools
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.5.1"
+
+      - name: Test and build debug APK
+        run: gradle --no-daemon testDebugUnitTest assembleDebug
+
+      - name: Prepare release signing
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.sign_release) ||
+          (github.event_name == 'push' && github.repository == 'UmiSlat/ABK_FIDO_KEY_MODULE' && github.ref == 'refs/heads/feat/userspace-fido')
+        env:
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEYSTORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for secret_name in ANDROID_SIGNING_KEYSTORE_BASE64 ANDROID_SIGNING_KEYSTORE_PASSWORD ANDROID_SIGNING_KEY_ALIAS ANDROID_SIGNING_KEY_PASSWORD; do
+            if [ -z "${!secret_name}" ]; then
+              echo "Missing required signing secret: $secret_name" >&2
+              exit 1
+            fi
+          done
+          umask 077
+          mkdir -p "$RUNNER_TEMP/android-signing"
+          printf '%s' "$ANDROID_SIGNING_KEYSTORE_BASE64" | tr -d '\r\n' | \
+            base64 --decode > "$RUNNER_TEMP/android-signing/release.jks"
+          keytool -list -keystore "$RUNNER_TEMP/android-signing/release.jks" \
+            -storepass:env ANDROID_SIGNING_KEYSTORE_PASSWORD \
+            -alias "$ANDROID_SIGNING_KEY_ALIAS" >/dev/null
+
+      - name: Build signed release APK
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.sign_release) ||
+          (github.event_name == 'push' && github.repository == 'UmiSlat/ABK_FIDO_KEY_MODULE' && github.ref == 'refs/heads/feat/userspace-fido')
+        env:
+          ANDROID_SIGNING_STORE_FILE: ${{ runner.temp }}/android-signing/release.jks
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEYSTORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+        run: gradle --no-daemon assembleRelease
+
+      - name: Verify release signature
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.sign_release) ||
+          (github.event_name == 'push' && github.repository == 'UmiSlat/ABK_FIDO_KEY_MODULE' && github.ref == 'refs/heads/feat/userspace-fido')
+        run: |
+          set -euo pipefail
+          apksigner="$(find "$ANDROID_HOME/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)"
+          test -n "$apksigner"
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/*release.apk)
+          test "${#apks[@]}" -eq 1
+          "$apksigner" verify "${apks[0]}"
+
+      - name: Remove temporary signing material
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/android-signing"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: abk-fido-companion-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload signed release APK
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.sign_release) ||
+          (github.event_name == 'push' && github.repository == 'UmiSlat/ABK_FIDO_KEY_MODULE' && github.ref == 'refs/heads/feat/userspace-fido')
+        uses: actions/upload-artifact@v4
+        with:
+          name: abk-fido-companion-release
+          path: app/build/outputs/apk/release/*release.apk
+          if-no-files-found: error
+
+      - name: Upload companion test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: abk-fido-companion-test-reports
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+          if-no-files-found: ignore

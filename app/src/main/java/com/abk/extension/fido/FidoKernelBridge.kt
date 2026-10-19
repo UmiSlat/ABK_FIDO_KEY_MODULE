@@ -28,6 +28,7 @@ internal data class PendingAuthRequest(
 
 internal object FidoKernelBridge {
     fun readPendingAuthRequest(): PendingAuthRequest? {
+        if (FidoDaemonBridge.isInstalled()) return FidoDaemonBridge.pending()
         val pending = RootShell.readTextFile(AUTH_PENDING_PATH)
         if (!pending.success) {
             Log.w(TAG, "read auth_pending failed exit=${pending.exitCode} out=${pending.stdout}")
@@ -70,28 +71,37 @@ internal object FidoKernelBridge {
     }
 
     fun allow(requestId: Int): RootShell.CommandResult =
-        RootShell.writeTextFile(AUTH_DECISION_PATH, "allow $requestId\n")
+        if (FidoDaemonBridge.isInstalled()) FidoDaemonBridge.decide(requestId, true)
+        else RootShell.writeTextFile(AUTH_DECISION_PATH, "allow $requestId\n")
 
     fun deny(requestId: Int): RootShell.CommandResult =
-        RootShell.writeTextFile(AUTH_DECISION_PATH, "deny $requestId\n")
+        if (FidoDaemonBridge.isInstalled()) FidoDaemonBridge.decide(requestId, false)
+        else RootShell.writeTextFile(AUTH_DECISION_PATH, "deny $requestId\n")
 
     fun readLastError(): String =
-        RootShell.readTextFile(LAST_ERROR_PATH).stdout.trim()
+        if (FidoDaemonBridge.isInstalled()) FidoDaemonBridge.status()?.let {
+            it.optString("last_error").ifBlank { it.optString("usb_error") }
+        }.orEmpty() else RootShell.readTextFile(LAST_ERROR_PATH).stdout.trim()
 
     fun readLastTrace(): String =
-        RootShell.readTextFile(LAST_TRACE_PATH).stdout.trim()
+        if (FidoDaemonBridge.isInstalled()) FidoDaemonBridge.status()?.optString("last_trace").orEmpty()
+        else RootShell.readTextFile(LAST_TRACE_PATH).stdout.trim()
 
     fun readCredentialCount(): Int? =
-        RootShell.readTextFile(CREDENTIAL_COUNT_PATH).stdout.trim().toIntOrNull()
+        if (FidoDaemonBridge.isInstalled()) FidoDaemonBridge.status()?.optInt("credential_count")
+        else RootShell.readTextFile(CREDENTIAL_COUNT_PATH).stdout.trim().toIntOrNull()
 
     fun readStoreGeneration(): Int? =
-        RootShell.readTextFile(STORE_GENERATION_PATH).stdout.trim().toIntOrNull()
+        if (FidoDaemonBridge.isInstalled()) FidoDaemonBridge.status()?.optLong("store_generation")?.toInt()
+        else RootShell.readTextFile(STORE_GENERATION_PATH).stdout.trim().toIntOrNull()
 
     fun restoreMetadata(): RootShell.CommandResult =
-        RootShell.writeTextFile(RESTORE_METADATA_PATH, "1\n")
+        if (FidoDaemonBridge.isInstalled()) RootShell.CommandResult(1, "Use the daemon store transaction")
+        else RootShell.writeTextFile(RESTORE_METADATA_PATH, "1\n")
 
     fun reloadStore(): RootShell.CommandResult =
-        RootShell.writeTextFile(RELOAD_STORE_PATH, "1\n")
+        if (FidoDaemonBridge.isInstalled()) RootShell.CommandResult(1, "The daemon owns the live store")
+        else RootShell.writeTextFile(RELOAD_STORE_PATH, "1\n")
 
     /**
      * Whether the driver holds every CTAP operation until this app decides.
@@ -100,28 +110,34 @@ internal object FidoKernelBridge {
      * while the switch is off.
      */
     fun readAuthGateEnabled(): Boolean? =
-        when (RootShell.readTextFile(AUTH_GATE_ENABLED_PATH).stdout.trim()) {
+        if (FidoDaemonBridge.isInstalled()) FidoDaemonBridge.status()?.optBoolean("auth_gate_enabled")
+        else when (RootShell.readTextFile(AUTH_GATE_ENABLED_PATH).stdout.trim()) {
             "1" -> true
             "0" -> false
             else -> null
         }
 
     fun writeAuthGateEnabled(enabled: Boolean): RootShell.CommandResult =
-        RootShell.writeTextFile(AUTH_GATE_ENABLED_PATH, if (enabled) "1\n" else "0\n")
+        if (FidoDaemonBridge.isInstalled()) RootShell.CommandResult(if (enabled) 0 else 1,
+            if (enabled) "" else "Local approval is mandatory")
+        else RootShell.writeTextFile(AUTH_GATE_ENABLED_PATH, if (enabled) "1\n" else "0\n")
 
     /** True once the gadget is bound to a UDC, i.e. the key can talk over USB. */
     fun readBound(): Boolean? =
-        when (RootShell.readTextFile(BOUND_PATH).stdout.trim()) {
+        if (FidoDaemonBridge.isInstalled()) FidoDaemonBridge.status()?.optBoolean("bound")
+        else when (RootShell.readTextFile(BOUND_PATH).stdout.trim()) {
             "1" -> true
             "0" -> false
             else -> null
         }
 
     fun readHidDevice(): String =
-        RootShell.readTextFile(HID_DEV_PATH).stdout.trim()
+        if (FidoDaemonBridge.isInstalled()) FidoDaemonBridge.status()?.optString("hid_dev").orEmpty()
+        else RootShell.readTextFile(HID_DEV_PATH).stdout.trim()
 
     fun isPresent(): Boolean =
-        RootShell.run("[ -d $SYSFS_BASE ]").success
+        if (FidoDaemonBridge.isInstalled()) FidoDaemonBridge.status() != null
+        else RootShell.run("[ -d $SYSFS_BASE ]").success
 
     fun waitForCredentialCountAtLeast(target: Int, attempts: Int = 20, delayMs: Long = 200): Int? {
         repeat(attempts) {

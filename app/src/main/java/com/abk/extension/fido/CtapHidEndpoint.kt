@@ -6,6 +6,10 @@ import android.util.Base64
 
 /** Raw 64-byte CTAP HID transport exposed by the kernel for local providers. */
 internal class CtapHidEndpoint : Closeable {
+    private val session = java.util.UUID.randomUUID().toString().replace("-", "")
+    // Pin the backend for the lifetime of a ceremony; never redirect packets
+    // from a stopped daemon into the legacy driver's global queue.
+    private val userspace = FidoDaemonBridge.isInstalled()
     fun transceive(cid: Int, command: Int, payload: ByteArray, timeoutMs: Long = 30_000): ByteArray {
         return withTransportLock {
             writeMessage(cid, command, payload)
@@ -50,6 +54,11 @@ internal class CtapHidEndpoint : Closeable {
 
     fun writePacket(packet: ByteArray) {
         require(packet.size == 64) { "CTAP HID packet must be 64 bytes" }
+        if (userspace) {
+            val result = FidoDaemonBridge.writePacket(session, packet)
+            if (!result.success) throw IOException("FIDO service write failed: ${result.stdout}")
+            return
+        }
         val encoded = Base64.encodeToString(packet, Base64.NO_WRAP)
         // A rejected write means nothing reached the endpoint queue, so one
         // retry cannot duplicate a packet. It covers a transiently full kernel
@@ -65,6 +74,12 @@ internal class CtapHidEndpoint : Closeable {
     }
 
     fun readPacket(timeoutSeconds: Long = MAX_READ_SECONDS): ByteArray {
+        if (userspace) {
+            val packet = FidoDaemonBridge.readPacket(session, timeoutSeconds)
+                ?: throw IOException("FIDO service read failed or timed out")
+            if (packet.size != 64) throw IOException("short CTAP HID packet: ${packet.size}")
+            return packet
+        }
         val result = RootShell.readDeviceBase64(DEVICE, 64, timeoutSeconds)
         if (!result.success) throw IOException("read CTAP endpoint failed: ${result.stdout}")
         val packet = Base64.decode(result.stdout.trim(), Base64.DEFAULT)
@@ -99,7 +114,9 @@ internal class CtapHidEndpoint : Closeable {
         for (i in 0 until len) dst.add(src[off + i])
     }
 
-    override fun close() = Unit
+    override fun close() {
+        if (userspace) FidoDaemonBridge.closeSession(session)
+    }
 
     companion object {
         const val DEVICE = "/dev/abk_fido_ctap"

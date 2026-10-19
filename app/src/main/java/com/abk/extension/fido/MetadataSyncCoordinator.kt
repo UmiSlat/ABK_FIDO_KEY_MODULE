@@ -66,6 +66,22 @@ internal class MetadataSyncCoordinator(context: Context) {
                 return SyncResult(success = false, notes = notes)
             }
 
+            if (FidoDaemonBridge.isInstalled()) {
+                // The daemon is the single writer. SQLite is only a mirror;
+                // never restore a stale snapshot over a live signing counter.
+                val snapshot = FidoDaemonBridge.snapshot()
+                    ?: return SyncResult(false, notes + "FIDO service is unavailable; persistent store left unchanged")
+                localDbFile.parentFile?.mkdirs()
+                val repository = StoreSnapshotRepository(localDbFile)
+                repository.ensureSchema()
+                repository.saveSnapshot(snapshot.blob.toBytes())
+                val mirrorPath = "/data/adb/abk-fido/abk_fido.db"
+                val export = RootShell.copyFileToMetadata(localDbFile.absolutePath, mirrorPath)
+                if (!export.success) return SyncResult(false, notes + "failed to export sqlite mirror")
+                return SyncResult(true, notes + listOf("backend=userspace", "generation=${snapshot.generation}",
+                    "mirrored ${snapshot.blob.credentials().size} credentials to $mirrorPath"))
+            }
+
             val ensureBlobFile = RootShell.ensureEmptyFileIfMissing(METADATA_BLOB_PATH)
             when {
                 !ensureBlobFile.success -> {

@@ -1,0 +1,2 @@
+# Independent host implementation; test-only, never packaged into Android.
+fido2==2.2.1

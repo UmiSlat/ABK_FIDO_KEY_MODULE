@@ -42,3 +42,7 @@ windows/**/x64/
 
 # Go agent build output
 agent/abk-fido-agent
+
+# Standalone authenticator artifacts
+dist/
+daemon/abk-fidod

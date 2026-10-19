@@ -15,7 +15,6 @@ import android.util.Log
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import kotlin.concurrent.thread
-import java.security.SecureRandom
 
 class FidoSyncService : Service() {
     private var lanServer: LanFidoServer? = null
@@ -72,12 +71,7 @@ class FidoSyncService : Service() {
     }
 
     private fun readPairingCode(): String {
-        val path = "/metadata/abk_fido_pairing_code"
-        val existing = RootShell.readTextFile(path).stdout.trim()
-        if (existing.matches(Regex("[0-9]{6,12}"))) return existing
-        val generated = (100000 + SecureRandom().nextInt(900000)).toString()
-        RootShell.writeTextFile(path, generated + "\n")
-        return generated
+        return FidoStoragePaths.readPairingCode(create = true)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -124,8 +118,13 @@ class FidoSyncService : Service() {
         val relayWanted = settings.fidoEnabled && settings.wirelessEnabled
         val current = lanServer
         if (relayWanted && current == null) {
+            val code = readPairingCode()
+            if (code.isBlank()) {
+                Log.w(TAG, "LAN relay not started: cannot persist the pairing code")
+                return
+            }
             lanServer = LanFidoServer(
-                pairingCode = readPairingCode(),
+                pairingCode = code,
                 registry = clients,
                 settings = settings,
                 listener = pendingClientListener,
@@ -255,11 +254,13 @@ class FidoSyncService : Service() {
             }
             FidoKernelBridge.deny(pending.requestId)
             RootShell.launchAbkExtensionManager()
-            BiometricAuthBridge.finish(false)
+            BiometricAuthBridge.finish(pending.requestId, false)
             return
         }
 
-        val result = BiometricAuthBridge.await(AUTH_PROMPT_TIMEOUT_MS)
+        val result = BiometricAuthBridge.await(pending.requestId, AUTH_PROMPT_TIMEOUT_MS) {
+            FidoKernelBridge.readPendingAuthRequest()?.requestId == pending.requestId
+        }
         Log.i(TAG, "auth result requestId=${pending.requestId} result=${result?.toString() ?: "timeout"}")
         when (result) {
             true -> {
