@@ -164,6 +164,7 @@
 #define ABK_FIDO_CRED_FLAG_UP			0x01
 #define ABK_FIDO_CRED_FLAG_UV			0x04
 #define ABK_FIDO_CRED_FLAG_AT			0x40
+#define ABK_FIDO_CRED_FLAG_ED			0x80
 
 struct abk_fido_report {
 	size_t len;
@@ -3357,6 +3358,7 @@ static noinline_for_stack int abk_fido_make_credential_resp(struct abk_fido_make
 			goto revert;
 		}
 		auth_data_len += ew.pos;
+		auth_data[32] |= ABK_FIDO_CRED_FLAG_ED;
 	}
 
 	memcpy(to_sign, auth_data, auth_data_len);
@@ -3463,6 +3465,7 @@ static noinline_for_stack int abk_fido_encode_assertion_locked(unsigned int slot
 		if (ew.err)
 			return ew.err;
 		auth_data_len += ew.pos;
+		auth_data[32] |= ABK_FIDO_CRED_FLAG_ED;
 	}
 
 	memcpy(to_sign, auth_data, auth_data_len);
