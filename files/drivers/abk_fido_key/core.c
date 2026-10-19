@@ -25,6 +25,7 @@
 #include <linux/namei.h>
 #include <linux/poll.h>
 #include <linux/random.h>
+#include <linux/sched/task.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -1036,13 +1037,14 @@ static struct file *abk_fido_filp_open_kernel(const char *path, int flags, umode
 	struct cred *cred;
 	struct file *file;
 
-	cred = prepare_kernel_cred(NULL);
+	cred = prepare_kernel_cred(&init_task);
 	if (!cred)
 		return ERR_PTR(-ENOMEM);
 
 	old = override_creds(cred);
 	file = filp_open(path, flags, mode);
 	revert_creds(old);
+	put_cred(cred);
 	return file;
 }
 
@@ -1052,13 +1054,14 @@ static ssize_t abk_fido_kernel_read(struct file *file, void *buf, size_t len, lo
 	struct cred *cred;
 	ssize_t ret;
 
-	cred = prepare_kernel_cred(NULL);
+	cred = prepare_kernel_cred(&init_task);
 	if (!cred)
 		return -ENOMEM;
 
 	old = override_creds(cred);
 	ret = kernel_read(file, buf, len, pos);
 	revert_creds(old);
+	put_cred(cred);
 	return ret;
 }
 
@@ -1068,13 +1071,14 @@ static ssize_t abk_fido_kernel_write(struct file *file, const void *buf, size_t 
 	struct cred *cred;
 	ssize_t ret;
 
-	cred = prepare_kernel_cred(NULL);
+	cred = prepare_kernel_cred(&init_task);
 	if (!cred)
 		return -ENOMEM;
 
 	old = override_creds(cred);
 	ret = kernel_write(file, buf, len, pos);
 	revert_creds(old);
+	put_cred(cred);
 	return ret;
 }
 

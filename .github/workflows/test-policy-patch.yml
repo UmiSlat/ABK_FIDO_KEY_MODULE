@@ -1,14 +1,16 @@
-name: Test FIDO SELinux patch
+name: Test FIDO kernel patches
 
 on:
   workflow_dispatch:
   push:
     paths:
+      - files/drivers/abk_fido_key/core.c
       - scripts/patch_kernelsu_sepolicy_for_abk_fido.py
       - tests/**
       - .github/workflows/test-policy-patch.yml
   pull_request:
     paths:
+      - files/drivers/abk_fido_key/core.c
       - scripts/patch_kernelsu_sepolicy_for_abk_fido.py
       - tests/**
       - .github/workflows/test-policy-patch.yml
