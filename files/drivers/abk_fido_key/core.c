@@ -14,6 +14,7 @@
 #include <linux/kernel.h>
 #include <linux/kmod.h>
 #include <linux/kobject.h>
+#include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
@@ -166,6 +167,7 @@
 
 struct abk_fido_report {
 	size_t len;
+	u32 generation;
 	u8 data[ABK_FIDO_REPORT_LEN];
 };
 
@@ -350,7 +352,6 @@ struct abk_fido_usb;
 struct abk_fido_device {
 	struct mutex lock;
 	struct abk_fido_store store;
-	struct abk_fido_channel channels[ABK_FIDO_MAX_CHANNELS];
 	bool store_loaded;
 	bool store_dirty;
 	bool bound;
@@ -370,6 +371,10 @@ struct abk_fido_device {
 	 */
 	struct abk_fido_usb *auth_usb;
 	u32 auth_cid;
+	/* Grants and assertion continuations belong to one transport session. */
+	struct abk_fido_usb *ctap_usb;
+	u32 ctap_cid;
+	u32 ctap_generation;
 	struct delayed_work auth_keepalive_work;
 	wait_queue_head_t auth_wait;
 	bool auth_pending;
@@ -403,10 +408,13 @@ struct abk_fido_device {
 struct abk_fido_opts {
 	struct usb_function_instance func_inst;
 	int minor;
+	bool auto_attached;
 };
 
 struct abk_fido_usb {
 	struct usb_function func;
+	struct kref ref;
+	struct abk_fido_channel channels[ABK_FIDO_MAX_CHANNELS];
 	struct usb_ep *in_ep;
 	struct usb_ep *out_ep;
 	struct usb_request *in_req;
@@ -414,7 +422,17 @@ struct abk_fido_usb {
 	spinlock_t tx_lock;
 	bool tx_pending;
 	bool online;
+	bool dead;
+	bool cancel_tx;
+	u32 generation;
+	u32 active_generation;
+	u32 channels_generation;
+	u32 binding_id;
+	u8 interface_id;
+	char udc_name[64];
 	struct work_struct rx_work;
+	struct work_struct tx_work;
+	struct work_struct status_work;
 	struct abk_fido_queue rx_packets;
 	struct abk_fido_queue debug_rx;
 	struct abk_fido_queue tx_packets;
@@ -443,6 +461,8 @@ static bool abk_fido_usb_registered;
 
 static DEFINE_IDA(abk_fido_ida);
 static DEFINE_MUTEX(abk_fido_ida_lock);
+/* USB and local CTAP share one approval and keepalive transaction. */
+static DEFINE_MUTEX(abk_fido_ctap_lock);
 
 static const u8 abk_fido_report_desc[ABK_FIDO_REPORT_DESC_LEN] = {
 	0x06, 0xd0, 0xf1,
@@ -642,8 +662,8 @@ static void abk_fido_queue_init(struct abk_fido_queue *queue)
 	queue->count = 0;
 }
 
-static bool abk_fido_queue_push(struct abk_fido_queue *queue,
-				const u8 *data, size_t len)
+static bool abk_fido_queue_push_tagged(struct abk_fido_queue *queue,
+				     const u8 *data, size_t len, u32 generation)
 {
 	unsigned long flags;
 	struct abk_fido_report *slot;
@@ -661,11 +681,18 @@ static bool abk_fido_queue_push(struct abk_fido_queue *queue,
 	memset(slot, 0, sizeof(*slot));
 	memcpy(slot->data, data, len);
 	slot->len = len;
+	slot->generation = generation;
 	queue->tail = (queue->tail + 1) % ABK_FIDO_QUEUE_DEPTH;
 	queue->count++;
 	spin_unlock_irqrestore(&queue->lock, flags);
 	wake_up_interruptible(&queue->wait);
 	return true;
+}
+
+static bool abk_fido_queue_push(struct abk_fido_queue *queue,
+			       const u8 *data, size_t len)
+{
+	return abk_fido_queue_push_tagged(queue, data, len, 0);
 }
 
 static bool abk_fido_queue_pop(struct abk_fido_queue *queue,
@@ -706,9 +733,15 @@ static int abk_fido_shash_digest(const char *alg,
 	int ret;
 	size_t size;
 
+	if (!alg || (!data && len) || !out || len > UINT_MAX)
+		return -EINVAL;
 	tfm = crypto_alloc_shash(alg, 0, 0);
 	if (IS_ERR(tfm))
 		return PTR_ERR(tfm);
+	if (out_len != crypto_shash_digestsize(tfm)) {
+		crypto_free_shash(tfm);
+		return -EINVAL;
+	}
 
 	size = sizeof(*desc) + crypto_shash_descsize(tfm);
 	desc = kzalloc(size, GFP_KERNEL);
@@ -719,7 +752,7 @@ static int abk_fido_shash_digest(const char *alg,
 
 	desc->tfm = tfm;
 	ret = crypto_shash_digest(desc, data, len, out);
-	kfree(desc);
+	kfree_sensitive(desc);
 	crypto_free_shash(tfm);
 	return ret;
 }
@@ -738,6 +771,9 @@ static int abk_fido_hmac_sha256(const u8 *key, size_t key_len,
 	size_t size;
 	int ret;
 
+	if ((!key && key_len) || (!data && data_len) || !out ||
+	    key_len > UINT_MAX || data_len > UINT_MAX)
+		return -EINVAL;
 	tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
 	if (IS_ERR(tfm)) {
 		pr_warn_ratelimited("abk_fido_key: hmac(sha256) unavailable: %ld\n",
@@ -756,7 +792,7 @@ static int abk_fido_hmac_sha256(const u8 *key, size_t key_len,
 	ret = crypto_shash_setkey(tfm, key, key_len);
 	if (!ret)
 		ret = crypto_shash_digest(desc, data, data_len, out);
-	kfree(desc);
+	kfree_sensitive(desc);
 	crypto_free_shash(tfm);
 	return ret;
 }
@@ -772,9 +808,12 @@ static int abk_fido_aes256_cbc(const u8 key[32], const u8 iv[16],
 	struct skcipher_request *req;
 	struct crypto_wait wait;
 	struct scatterlist sg;
+	u8 *buffer;
+	u8 *data;
 	int ret;
 
-	if (!in_len || in_len % AES_BLOCK_SIZE)
+	if (!key || !iv || !inout || !in_len ||
+	    in_len % AES_BLOCK_SIZE || in_len > UINT_MAX - AES_BLOCK_SIZE)
 		return -EINVAL;
 
 	tfm = crypto_alloc_skcipher("cbc(aes)", 0, 0);
@@ -794,17 +833,27 @@ static int abk_fido_aes256_cbc(const u8 key[32], const u8 iv[16],
 		return -ENOMEM;
 	}
 
+	/* Scatterlists require linear memory, even when the caller's buffer is
+	 * on a VMAP stack. CBC also updates its IV, so never pass the caller's
+	 * potentially read-only IV through to the cipher implementation.
+	 */
+	buffer = kmalloc(AES_BLOCK_SIZE + in_len, GFP_KERNEL);
+	if (!buffer) {
+		ret = -ENOMEM;
+		goto out_request;
+	}
+	data = buffer + AES_BLOCK_SIZE;
+	memcpy(buffer, iv, AES_BLOCK_SIZE);
+	memcpy(data, inout, in_len);
+
 	crypto_init_wait(&wait);
 	ret = crypto_skcipher_setkey(tfm, key, 32);
 	if (!ret) {
-		sg_init_one(&sg, inout, in_len);
+		sg_init_one(&sg, data, in_len);
 		skcipher_request_set_tfm(req, tfm);
 		skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
 					      crypto_req_done, &wait);
-		/* 5.15 declares the iv parameter as void * (6.1 made it
-		 * const), so the cast keeps both lines compiling.
-		 */
-		skcipher_request_set_crypt(req, &sg, &sg, in_len, (void *)iv);
+		skcipher_request_set_crypt(req, &sg, &sg, in_len, buffer);
 
 		if (encrypt)
 			ret = crypto_skcipher_encrypt(req);
@@ -814,7 +863,11 @@ static int abk_fido_aes256_cbc(const u8 key[32], const u8 iv[16],
 		 * is otherwise dropped as a confusing error.
 		 */
 		ret = crypto_wait_req(ret, &wait);
+		if (!ret)
+			memcpy(inout, data, in_len);
 	}
+	kfree_sensitive(buffer);
+out_request:
 	skcipher_request_zero(req);
 	skcipher_request_free(req);
 	crypto_free_skcipher(tfm);
@@ -828,22 +881,42 @@ static int abk_fido_kpp_run_sync(struct crypto_kpp *tfm, bool compute_shared,
 	struct kpp_request *req;
 	struct crypto_wait wait;
 	struct scatterlist in_sg, out_sg;
+	u8 *input = NULL;
+	u8 *output;
 	int ret;
+
+	if (!tfm || (!in && in_len) || !out || !out_len)
+		return -EINVAL;
 
 	req = kpp_request_alloc(tfm, GFP_KERNEL);
 	if (!req)
 		return -ENOMEM;
+
+	output = kzalloc(out_len, GFP_KERNEL);
+	if (!output) {
+		ret = -ENOMEM;
+		goto out_request;
+	}
+	if (in_len) {
+		input = kmemdup(in, in_len, GFP_KERNEL);
+		if (!input) {
+			ret = -ENOMEM;
+			goto out_buffers;
+		}
+	}
 
 	crypto_init_wait(&wait);
 	kpp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
 				 crypto_req_done, &wait);
 	/* kpp requests carry scatterlists; the ecdh driver copies req->src
 	 * with sg_copy_to_buffer(), so a raw pointer here would be read as
-	 * scatterlist metadata and crash or corrupt memory.
+	 * scatterlist metadata and crash or corrupt memory. Copy both sides to
+	 * linear allocations: callers may pass stack or vmalloc-backed memory.
 	 */
-	sg_init_one(&in_sg, in, in_len);
-	sg_init_one(&out_sg, out, out_len);
-	kpp_request_set_input(req, &in_sg, in_len);
+	if (in_len)
+		sg_init_one(&in_sg, input, in_len);
+	sg_init_one(&out_sg, output, out_len);
+	kpp_request_set_input(req, in_len ? &in_sg : NULL, in_len);
 	kpp_request_set_output(req, &out_sg, out_len);
 
 	if (compute_shared)
@@ -851,6 +924,16 @@ static int abk_fido_kpp_run_sync(struct crypto_kpp *tfm, bool compute_shared,
 	else
 		ret = crypto_kpp_generate_public_key(req);
 	ret = crypto_wait_req(ret, &wait);
+	if (!ret) {
+		if (req->dst_len != out_len)
+			ret = -EIO;
+		else
+			memcpy(out, output, out_len);
+	}
+out_buffers:
+	kfree_sensitive(input);
+	kfree_sensitive(output);
+out_request:
 	kpp_request_free(req);
 	return ret;
 }
@@ -863,9 +946,11 @@ static int abk_fido_ecdh_p256(const u8 priv[32], const u8 peer_xy[64],
 {
 	struct crypto_kpp *tfm;
 	u8 secret[sizeof(struct kpp_secret) + sizeof(u16) + 32];
-	u8 raw_x[32];
+	u8 raw_x[32] = {};
 	int ret;
 
+	if (!priv || !peer_xy || !shared)
+		return -EINVAL;
 	tfm = crypto_alloc_kpp("ecdh-nist-p256", 0, 0);
 	if (IS_ERR(tfm)) {
 		pr_warn_ratelimited("abk_fido_key: ecdh-nist-p256 unavailable: %ld\n",
@@ -890,10 +975,8 @@ static int abk_fido_ecdh_p256(const u8 priv[32], const u8 peer_xy[64],
 		ret = abk_fido_kpp_run_sync(tfm, true, peer_xy, 64,
 					    raw_x, sizeof(raw_x));
 	crypto_free_kpp(tfm);
-	if (ret)
-		return ret;
-
-	ret = abk_fido_sha256(raw_x, sizeof(raw_x), shared);
+	if (!ret)
+		ret = abk_fido_sha256(raw_x, sizeof(raw_x), shared);
 	memzero_explicit(raw_x, sizeof(raw_x));
 	return ret;
 }
@@ -1337,6 +1420,8 @@ static int abk_cbor_read_int(struct abk_cbor_reader *r, s64 *value)
 	ret = abk_cbor_read_head(r, &major, &tmp);
 	if (ret)
 		return ret;
+	if (tmp > S64_MAX)
+		return -EINVAL;
 	if (major == 0)
 		*value = (s64)tmp;
 	else if (major == 1)
@@ -1355,7 +1440,7 @@ static int abk_cbor_read_bytes(struct abk_cbor_reader *r, struct abk_fido_slice 
 	ret = abk_cbor_read_head(r, &major, &len);
 	if (ret)
 		return ret;
-	if (major != 2 || r->pos + len > r->len)
+	if (major != 2 || len > r->len - r->pos)
 		return -EINVAL;
 	slice->ptr = r->buf + r->pos;
 	slice->len = len;
@@ -1372,7 +1457,7 @@ static int abk_cbor_read_text(struct abk_cbor_reader *r, struct abk_fido_slice *
 	ret = abk_cbor_read_head(r, &major, &len);
 	if (ret)
 		return ret;
-	if (major != 3 || r->pos + len > r->len)
+	if (major != 3 || len > r->len - r->pos)
 		return -EINVAL;
 	slice->ptr = r->buf + r->pos;
 	slice->len = len;
@@ -1404,7 +1489,7 @@ static int abk_cbor_read_map(struct abk_cbor_reader *r, u64 *count)
 	ret = abk_cbor_read_head(r, &major, &len);
 	if (ret)
 		return ret;
-	if (major != 5)
+	if (major != 5 || len > (r->len - r->pos) / 2)
 		return -EINVAL;
 	*count = len;
 	return 0;
@@ -1419,7 +1504,7 @@ static int abk_cbor_read_array(struct abk_cbor_reader *r, u64 *count)
 	ret = abk_cbor_read_head(r, &major, &len);
 	if (ret)
 		return ret;
-	if (major != 4)
+	if (major != 4 || len > r->len - r->pos)
 		return -EINVAL;
 	*count = len;
 	return 0;
@@ -1427,45 +1512,49 @@ static int abk_cbor_read_array(struct abk_cbor_reader *r, u64 *count)
 
 static int abk_cbor_skip(struct abk_cbor_reader *r)
 {
+	/* Never recurse on host-controlled nesting on a kernel stack. */
+	u64 remaining[16] = { 1 };
+	unsigned int depth = 0;
 	u8 major;
 	u64 len;
 	int ret;
-	u64 i;
 
-	ret = abk_cbor_read_head(r, &major, &len);
-	if (ret)
-		return ret;
+	for (;;) {
+		if (!remaining[depth]) {
+			if (!depth)
+				return 0;
+			depth--;
+			continue;
+		}
+		remaining[depth]--;
+		ret = abk_cbor_read_head(r, &major, &len);
+		if (ret)
+			return ret;
 
-	switch (major) {
-	case 0:
-	case 1:
-	case 7:
-		return 0;
-	case 2:
-	case 3:
-		if (r->pos + len > r->len)
+		switch (major) {
+		case 0:
+		case 1:
+		case 7:
+			break;
+		case 2:
+		case 3:
+			if (len > r->len - r->pos)
+				return -EINVAL;
+			r->pos += len;
+			break;
+		case 4:
+		case 5:
+			if (len > (r->len - r->pos) / (major == 5 ? 2 : 1))
+				return -EINVAL;
+			if (!len)
+				break;
+			if (depth + 1 >= ARRAY_SIZE(remaining))
+				return -EINVAL;
+			remaining[++depth] = major == 5 ? len * 2 : len;
+			break;
+		default:
 			return -EINVAL;
-		r->pos += len;
-		return 0;
-	case 4:
-		for (i = 0; i < len; i++) {
-			ret = abk_cbor_skip(r);
-			if (ret)
-				return ret;
 		}
-		return 0;
-	case 5:
-		for (i = 0; i < len; i++) {
-			ret = abk_cbor_skip(r);
-			if (ret)
-				return ret;
-			ret = abk_cbor_skip(r);
-			if (ret)
-				return ret;
-		}
-		return 0;
-	default:
-		return -EINVAL;
 	}
 }
 
@@ -2265,10 +2354,22 @@ static void abk_fido_auth_keepalive_worker(struct work_struct *work)
 			 msecs_to_jiffies(500));
 }
 
+static bool abk_fido_session_gone(struct abk_fido_usb *usb, u32 generation)
+{
+	return usb && !usb->userspace &&
+		(!READ_ONCE(usb->online) || READ_ONCE(usb->dead) ||
+		 READ_ONCE(usb->generation) != generation);
+}
+
 static int abk_fido_auth_begin_locked(u8 ctap_cmd, const char *rp_id, bool uv, bool rk)
 {
+	struct abk_fido_usb *usb = abk_fido_dev.auth_usb;
+	u32 generation = usb ? READ_ONCE(usb->active_generation) : 0;
 	long wait_ret;
 	u32 request_id;
+
+	if (abk_fido_session_gone(usb, generation))
+		return -ESHUTDOWN;
 
 	/* Every operation that can release key material has to be approved
 	 * locally; there is no switch that turns this off. The only shortcut is
@@ -2322,9 +2423,18 @@ static int abk_fido_auth_begin_locked(u8 ctap_cmd, const char *rp_id, bool uv, b
 	wake_up_interruptible(&abk_fido_dev.auth_wait);
 	wait_ret = wait_event_interruptible_timeout(
 		abk_fido_dev.auth_wait,
-		READ_ONCE(abk_fido_dev.auth_decided),
+		READ_ONCE(abk_fido_dev.auth_decided) ||
+		abk_fido_session_gone(usb, generation),
 		msecs_to_jiffies(30000));
 	mutex_lock(&abk_fido_dev.lock);
+
+	if (abk_fido_session_gone(usb, generation)) {
+		abk_fido_dev.auth_pending = false;
+		abk_fido_dev.auth_decided = false;
+		abk_fido_dev.auth_allowed = false;
+		abk_fido_dev.auth_cache_valid = false;
+		return -ESHUTDOWN;
+	}
 
 	if (wait_ret < 0) {
 		abk_fido_dev.auth_pending = false;
@@ -3415,7 +3525,7 @@ static noinline_for_stack int abk_fido_hmac_get_secret_locked(
 	struct abk_fido_credential *cred = &abk_fido_dev.store.creds[slot];
 	u8 shared[SHA256_DIGEST_SIZE];
 	u8 salt[ABK_FIDO_HMAC_SALT_LEN * 2];
-	u8 tag[ABK_FIDO_HMAC_SALT_AUTH_LEN];
+	u8 tag[SHA256_DIGEST_SIZE];
 	u8 outputs[64];
 	int ret;
 
@@ -3439,18 +3549,17 @@ static noinline_for_stack int abk_fido_hmac_get_secret_locked(
 	/* The comparison value comes from the host, so a constant-time
 	 * comparison buys nothing here.
 	 */
-	if (memcmp(tag, req->hmac_salt_auth, sizeof(tag))) {
+	if (memcmp(tag, req->hmac_salt_auth, ABK_FIDO_HMAC_SALT_AUTH_LEN)) {
 		pr_warn("abk_fido_key: hmac-secret saltAuth mismatch\n");
 		ret = -EINVAL;
 		goto out;
 	}
 
+	memcpy(salt, req->hmac_salt_enc, sizeof(salt));
 	ret = abk_fido_aes256_cbc(shared, abk_fido_hmac_zero_iv,
-				  (u8 *)req->hmac_salt_enc,
-				  sizeof(req->hmac_salt_enc), false);
+				  salt, sizeof(salt), false);
 	if (ret)
 		goto out;
-	memcpy(salt, req->hmac_salt_enc, sizeof(salt));
 
 	ret = abk_fido_hmac_sha256(cred->hmac_secret,
 				   sizeof(cred->hmac_secret),
@@ -3810,32 +3919,32 @@ static noinline_for_stack int abk_fido_cbor_dispatch(const u8 *msg, size_t len,
 	}
 }
 
-static struct abk_fido_channel *abk_fido_find_channel_locked(u32 cid)
+static struct abk_fido_channel *abk_fido_find_channel_locked(
+	struct abk_fido_usb *usb, u32 cid)
 {
 	unsigned int i;
 
 	for (i = 0; i < ABK_FIDO_MAX_CHANNELS; i++) {
-		if (abk_fido_dev.channels[i].in_use &&
-		    abk_fido_dev.channels[i].cid == cid)
-			return &abk_fido_dev.channels[i];
+		if (usb->channels[i].in_use && usb->channels[i].cid == cid)
+			return &usb->channels[i];
 	}
 	return NULL;
 }
 
-static struct abk_fido_channel *abk_fido_alloc_channel_locked(u32 cid)
+static struct abk_fido_channel *abk_fido_alloc_channel_locked(
+	struct abk_fido_usb *usb, u32 cid)
 {
 	unsigned int i;
 
 	for (i = 0; i < ABK_FIDO_MAX_CHANNELS; i++) {
-		if (!abk_fido_dev.channels[i].in_use) {
-			memset(&abk_fido_dev.channels[i], 0,
-			       sizeof(abk_fido_dev.channels[i]));
-			abk_fido_dev.channels[i].in_use = true;
-			abk_fido_dev.channels[i].cid = cid;
-			return &abk_fido_dev.channels[i];
+		if (!usb->channels[i].in_use) {
+			memset(&usb->channels[i], 0, sizeof(usb->channels[i]));
+			usb->channels[i].in_use = true;
+			usb->channels[i].cid = cid;
+			return &usb->channels[i];
 		}
 	}
-	return &abk_fido_dev.channels[0];
+	return &usb->channels[0];
 }
 
 static u32 abk_fido_next_cid_locked(void)
@@ -3856,9 +3965,19 @@ static void abk_fido_send_hid_message(struct abk_fido_usb *usb, u32 cid, u8 cmd,
 	size_t offset = 0;
 	u8 seq = 0;
 	size_t chunk;
+	unsigned long flags = 0;
+	u32 generation = 0;
 
 	if (!usb)
 		usb = &abk_fido_user_usb;
+	if (!usb->userspace) {
+		spin_lock_irqsave(&usb->tx_lock, flags);
+		generation = usb->active_generation;
+		if (!usb->online || usb->dead || generation != usb->generation) {
+			spin_unlock_irqrestore(&usb->tx_lock, flags);
+			return;
+		}
+	}
 
 	memset(packet, 0, sizeof(packet));
 	put_unaligned_be32(cid, packet);
@@ -3867,7 +3986,7 @@ static void abk_fido_send_hid_message(struct abk_fido_usb *usb, u32 cid, u8 cmd,
 	chunk = min_t(size_t, len, ABK_FIDO_REPORT_LEN - 7);
 	if (chunk)
 		memcpy(packet + 7, payload, chunk);
-	abk_fido_queue_push(&usb->tx_packets, packet, sizeof(packet));
+	abk_fido_queue_push_tagged(&usb->tx_packets, packet, sizeof(packet), generation);
 	offset += chunk;
 
 	while (offset < len) {
@@ -3876,14 +3995,16 @@ static void abk_fido_send_hid_message(struct abk_fido_usb *usb, u32 cid, u8 cmd,
 		packet[4] = seq++;
 		chunk = min_t(size_t, len - offset, ABK_FIDO_REPORT_LEN - 5);
 		memcpy(packet + 5, payload + offset, chunk);
-		abk_fido_queue_push(&usb->tx_packets, packet, sizeof(packet));
+		abk_fido_queue_push_tagged(&usb->tx_packets, packet, sizeof(packet), generation);
 		offset += chunk;
 	}
 
 	if (usb->userspace)
 		wake_up_interruptible(&usb->tx_packets.wait);
-	else
+	else {
 		abk_fido_tx_kick(usb);
+		spin_unlock_irqrestore(&usb->tx_lock, flags);
+	}
 }
 
 static void abk_fido_send_hid_error(struct abk_fido_usb *usb, u32 cid, u8 err)
@@ -3916,6 +4037,7 @@ static void abk_fido_dispatch_msg(struct abk_fido_usb *usb, u32 cid, u8 cmd,
 	u8 init_resp[17];
 	u8 cbor_cmd = len ? data[0] : 0;
 	u32 new_cid;
+	u32 generation;
 	int ret;
 
 	switch (cmd) {
@@ -3926,7 +4048,7 @@ static void abk_fido_dispatch_msg(struct abk_fido_usb *usb, u32 cid, u8 cmd,
 		}
 		mutex_lock(&abk_fido_dev.lock);
 		new_cid = abk_fido_next_cid_locked();
-		abk_fido_alloc_channel_locked(new_cid);
+		abk_fido_alloc_channel_locked(usb, new_cid);
 		mutex_unlock(&abk_fido_dev.lock);
 		memcpy(init_resp, data, 8);
 		put_unaligned_be32(new_cid, init_resp + 8);
@@ -3946,12 +4068,27 @@ static void abk_fido_dispatch_msg(struct abk_fido_usb *usb, u32 cid, u8 cmd,
 		return;
 	case ABK_FIDO_HID_CANCEL:
 		mutex_lock(&abk_fido_dev.lock);
-		if (abk_fido_find_channel_locked(cid))
-			abk_fido_find_channel_locked(cid)->cancelled = true;
+		if (abk_fido_find_channel_locked(usb, cid))
+			abk_fido_find_channel_locked(usb, cid)->cancelled = true;
 		mutex_unlock(&abk_fido_dev.lock);
 		return;
 	case ABK_FIDO_HID_CBOR:
+		if (!mutex_trylock(&abk_fido_ctap_lock)) {
+			abk_fido_send_hid_error(usb, cid,
+					      ABK_FIDO_HID_ERR_CHANNEL_BUSY);
+			return;
+		}
 		mutex_lock(&abk_fido_dev.lock);
+		generation = READ_ONCE(usb->active_generation);
+		if (abk_fido_dev.ctap_usb != usb ||
+		    abk_fido_dev.ctap_cid != cid ||
+		    abk_fido_dev.ctap_generation != generation) {
+			abk_fido_dev.auth_cache_valid = false;
+			abk_fido_clear_assert_state_locked();
+		}
+		abk_fido_dev.ctap_usb = usb;
+		abk_fido_dev.ctap_cid = cid;
+		abk_fido_dev.ctap_generation = generation;
 		abk_fido_dev.auth_usb = usb;
 		abk_fido_dev.auth_cid = cid;
 		mutex_unlock(&abk_fido_dev.lock);
@@ -4023,6 +4160,7 @@ static void abk_fido_dispatch_msg(struct abk_fido_usb *usb, u32 cid, u8 cmd,
 			pr_warn("abk_fido_key: ctap cmd 0x%02x failed: %d\n",
 				cbor_cmd, ret);
 		}
+		mutex_unlock(&abk_fido_ctap_lock);
 		return;
 	default:
 		abk_fido_send_hid_error(usb, cid, ABK_FIDO_HID_ERR_INVALID_CMD);
@@ -4040,7 +4178,6 @@ static void abk_fido_process_packet(struct abk_fido_usb *usb, const u8 *packet, 
 	u8 *msg = NULL;
 	size_t msg_len = 0;
 	u8 cmd = 0;
-	int ret;
 
 	if (len != ABK_FIDO_REPORT_LEN)
 		return;
@@ -4048,15 +4185,12 @@ static void abk_fido_process_packet(struct abk_fido_usb *usb, const u8 *packet, 
 	/* A host that times out stops polling the IN endpoint: dequeue the stuck
 	 * transfer so the reply to this command can go out.
 	 */
-	spin_lock_irqsave(&usb->tx_lock, flags);
-	if (usb->tx_pending && usb->in_ep && usb->in_req) {
-		spin_unlock_irqrestore(&usb->tx_lock, flags);
-		ret = usb_ep_dequeue(usb->in_ep, usb->in_req);
-		if (ret && ret != -EINVAL)
-			pr_warn("abk_fido_key: dequeue of stuck IN request failed: %d\n",
-				ret);
-		/* tx_complete clears tx_pending when the dequeue completes. */
-	} else {
+	if (!usb->userspace) {
+		spin_lock_irqsave(&usb->tx_lock, flags);
+		if (usb->online && usb->tx_pending) {
+			usb->cancel_tx = true;
+			abk_fido_tx_kick(usb);
+		}
 		spin_unlock_irqrestore(&usb->tx_lock, flags);
 	}
 
@@ -4072,9 +4206,9 @@ static void abk_fido_process_packet(struct abk_fido_usb *usb, const u8 *packet, 
 			abk_fido_send_hid_error(usb, cid, ABK_FIDO_HID_ERR_INVALID_LEN);
 			return;
 		}
-		ch = abk_fido_find_channel_locked(cid);
+		ch = abk_fido_find_channel_locked(usb, cid);
 		if (!ch)
-			ch = abk_fido_alloc_channel_locked(cid);
+			ch = abk_fido_alloc_channel_locked(usb, cid);
 		memset(ch, 0, sizeof(*ch));
 		ch->in_use = true;
 		ch->cid = cid;
@@ -4101,7 +4235,7 @@ static void abk_fido_process_packet(struct abk_fido_usb *usb, const u8 *packet, 
 		return;
 	}
 
-	ch = abk_fido_find_channel_locked(cid);
+	ch = abk_fido_find_channel_locked(usb, cid);
 	if (!ch || !ch->in_use) {
 		mutex_unlock(&abk_fido_dev.lock);
 		abk_fido_send_hid_error(usb, cid, ABK_FIDO_HID_ERR_INVALID_CID);
@@ -4139,9 +4273,26 @@ static void abk_fido_rx_worker(struct work_struct *work)
 {
 	struct abk_fido_usb *usb = container_of(work, struct abk_fido_usb, rx_work);
 	struct abk_fido_report report;
+	unsigned long flags;
 
-	while (abk_fido_queue_pop(&usb->rx_packets, &report))
+	while (abk_fido_queue_pop(&usb->rx_packets, &report)) {
+		if (!usb->userspace) {
+			spin_lock_irqsave(&usb->tx_lock, flags);
+			if (!usb->online || usb->dead || report.generation != usb->generation) {
+				spin_unlock_irqrestore(&usb->tx_lock, flags);
+				continue;
+			}
+			WRITE_ONCE(usb->active_generation, report.generation);
+			spin_unlock_irqrestore(&usb->tx_lock, flags);
+			mutex_lock(&abk_fido_dev.lock);
+			if (usb->channels_generation != report.generation) {
+				memset(usb->channels, 0, sizeof(usb->channels));
+				usb->channels_generation = report.generation;
+			}
+			mutex_unlock(&abk_fido_dev.lock);
+		}
 		abk_fido_process_packet(usb, report.data, report.len);
+	}
 }
 
 static void abk_fido_tx_complete(struct usb_ep *ep, struct usb_request *req)
@@ -4151,77 +4302,165 @@ static void abk_fido_tx_complete(struct usb_ep *ep, struct usb_request *req)
 
 	spin_lock_irqsave(&usb->tx_lock, flags);
 	usb->tx_pending = false;
+	if (usb->online && !usb->dead)
+		schedule_work(&usb->tx_work);
 	spin_unlock_irqrestore(&usb->tx_lock, flags);
-	abk_fido_tx_kick(usb);
 }
 
 static void abk_fido_tx_kick(struct abk_fido_usb *usb)
 {
+	schedule_work(&usb->tx_work);
+}
+
+static void abk_fido_tx_worker(struct work_struct *work)
+{
+	struct abk_fido_usb *usb = container_of(work, struct abk_fido_usb, tx_work);
 	struct abk_fido_report report;
+	struct usb_request *req;
 	unsigned long flags;
 	int ret;
 
-	if (!usb->online || !usb->in_req)
-		return;
-	if (!abk_fido_queue_pop(&usb->tx_packets, &report))
-		return;
-
 	spin_lock_irqsave(&usb->tx_lock, flags);
-	if (usb->tx_pending) {
+	if (!usb->online || usb->dead || !usb->in_req) {
 		spin_unlock_irqrestore(&usb->tx_lock, flags);
-		abk_fido_queue_push(&usb->tx_packets, report.data, report.len);
 		return;
 	}
+	if (usb->cancel_tx && usb->tx_pending) {
+		usb->cancel_tx = false;
+		req = usb->in_req;
+		spin_unlock_irqrestore(&usb->tx_lock, flags);
+		/* dequeue may give the request back synchronously. Requests stay
+		 * allocated until unbind has joined this worker. */
+		ret = usb_ep_dequeue(usb->in_ep, req);
+		if (ret && ret != -EINVAL && ret != -ESHUTDOWN)
+			pr_warn("abk_fido_key: dequeue IN request failed: %d\n", ret);
+		return;
+	}
+	usb->cancel_tx = false;
+	if (usb->tx_pending) {
+		spin_unlock_irqrestore(&usb->tx_lock, flags);
+		return;
+	}
+	do {
+		if (!abk_fido_queue_pop(&usb->tx_packets, &report)) {
+			spin_unlock_irqrestore(&usb->tx_lock, flags);
+			return;
+		}
+	} while (report.generation != usb->generation);
 	usb->tx_pending = true;
-	spin_unlock_irqrestore(&usb->tx_lock, flags);
-
 	memset(usb->in_req->buf, 0, ABK_FIDO_REPORT_LEN);
 	memcpy(usb->in_req->buf, report.data, report.len);
 	usb->in_req->length = ABK_FIDO_REPORT_LEN;
 	ret = usb_ep_queue(usb->in_ep, usb->in_req, GFP_ATOMIC);
-	if (ret) {
-		spin_lock_irqsave(&usb->tx_lock, flags);
+	if (ret)
 		usb->tx_pending = false;
-		spin_unlock_irqrestore(&usb->tx_lock, flags);
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
+	if (ret)
 		pr_warn("abk_fido_key: failed to queue IN response: %d\n", ret);
-	}
 }
 
 static void abk_fido_out_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	struct abk_fido_usb *usb = req->context;
+	unsigned long flags;
 	int ret;
 
-	if (req->status == 0 && req->actual == ABK_FIDO_REPORT_LEN) {
+	spin_lock_irqsave(&usb->tx_lock, flags);
+	if (!usb->online || usb->dead || req->status) {
+		spin_unlock_irqrestore(&usb->tx_lock, flags);
+		return;
+	}
+	if (req->actual == ABK_FIDO_REPORT_LEN) {
 		abk_fido_queue_push(&usb->debug_rx, req->buf, req->actual);
-		abk_fido_queue_push(&usb->rx_packets, req->buf, req->actual);
+		abk_fido_queue_push_tagged(&usb->rx_packets, req->buf, req->actual,
+					 usb->generation);
 		schedule_work(&usb->rx_work);
 	}
 
 	req->actual = 0;
 	req->length = ABK_FIDO_REPORT_LEN;
 	ret = usb_ep_queue(ep, req, GFP_ATOMIC);
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
 	if (ret)
 		pr_warn("abk_fido_key: failed to requeue out request: %d\n", ret);
+}
+
+struct abk_fido_file {
+	struct abk_fido_usb *usb;
+	u32 binding_id;
+};
+
+static void abk_fido_usb_release(struct kref *ref)
+{
+	kfree(container_of(ref, struct abk_fido_usb, ref));
+}
+
+static bool abk_fido_file_gone(struct abk_fido_file *ctx)
+{
+	return READ_ONCE(ctx->usb->dead) || !READ_ONCE(ctx->usb->online) ||
+		READ_ONCE(ctx->usb->binding_id) != ctx->binding_id;
+}
+
+static int abk_fido_misc_open(struct inode *inode, struct file *file)
+{
+	struct miscdevice *misc = file->private_data;
+	struct abk_fido_usb *usb = container_of(misc, struct abk_fido_usb, miscdev);
+	struct abk_fido_file *ctx;
+	unsigned long flags;
+
+	ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+	spin_lock_irqsave(&usb->tx_lock, flags);
+	if (usb->dead) {
+		spin_unlock_irqrestore(&usb->tx_lock, flags);
+		kfree(ctx);
+		return -ENODEV;
+	}
+	kref_get(&usb->ref);
+	ctx->usb = usb;
+	ctx->binding_id = usb->binding_id;
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
+	file->private_data = ctx;
+	return 0;
+}
+
+static int abk_fido_misc_release(struct inode *inode, struct file *file)
+{
+	struct abk_fido_file *ctx = file->private_data;
+
+	kref_put(&ctx->usb->ref, abk_fido_usb_release);
+	kfree(ctx);
+	return 0;
 }
 
 static ssize_t abk_fido_misc_read(struct file *file, char __user *buf,
 				  size_t count, loff_t *ppos)
 {
-	struct miscdevice *misc = file->private_data;
-	struct abk_fido_usb *usb = container_of(misc, struct abk_fido_usb, miscdev);
+	struct abk_fido_file *ctx = file->private_data;
+	struct abk_fido_usb *usb = ctx->usb;
 	struct abk_fido_report report;
+	unsigned long flags;
 
 	if (count < ABK_FIDO_REPORT_LEN)
 		return -EINVAL;
-	if (!abk_fido_queue_pop(&usb->debug_rx, &report)) {
+	for (;;) {
+		spin_lock_irqsave(&usb->tx_lock, flags);
+		if (abk_fido_file_gone(ctx)) {
+			spin_unlock_irqrestore(&usb->tx_lock, flags);
+			return -ESHUTDOWN;
+		}
+		if (abk_fido_queue_pop(&usb->debug_rx, &report)) {
+			spin_unlock_irqrestore(&usb->tx_lock, flags);
+			break;
+		}
+		spin_unlock_irqrestore(&usb->tx_lock, flags);
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
 		if (wait_event_interruptible(usb->debug_rx.wait,
+					     abk_fido_file_gone(ctx) ||
 					     !abk_fido_queue_empty(&usb->debug_rx)))
 			return -ERESTARTSYS;
-		if (!abk_fido_queue_pop(&usb->debug_rx, &report))
-			return -EAGAIN;
 	}
 	if (copy_to_user(buf, report.data, report.len))
 		return -EFAULT;
@@ -4231,27 +4470,39 @@ static ssize_t abk_fido_misc_read(struct file *file, char __user *buf,
 static ssize_t abk_fido_misc_write(struct file *file, const char __user *buf,
 				   size_t count, loff_t *ppos)
 {
-	struct miscdevice *misc = file->private_data;
-	struct abk_fido_usb *usb = container_of(misc, struct abk_fido_usb, miscdev);
+	struct abk_fido_file *ctx = file->private_data;
+	struct abk_fido_usb *usb = ctx->usb;
 	u8 packet[ABK_FIDO_REPORT_LEN];
+	unsigned long flags;
 
 	if (count != ABK_FIDO_REPORT_LEN)
 		return -EINVAL;
 	if (copy_from_user(packet, buf, count))
 		return -EFAULT;
-	if (!abk_fido_queue_push(&usb->tx_packets, packet, count))
+	spin_lock_irqsave(&usb->tx_lock, flags);
+	if (abk_fido_file_gone(ctx)) {
+		spin_unlock_irqrestore(&usb->tx_lock, flags);
+		return -ESHUTDOWN;
+	}
+	if (!abk_fido_queue_push_tagged(&usb->tx_packets, packet, count,
+					usb->generation)) {
+		spin_unlock_irqrestore(&usb->tx_lock, flags);
 		return -EBUSY;
+	}
 	abk_fido_tx_kick(usb);
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
 	return count;
 }
 
 static __poll_t abk_fido_misc_poll(struct file *file, poll_table *wait)
 {
-	struct miscdevice *misc = file->private_data;
-	struct abk_fido_usb *usb = container_of(misc, struct abk_fido_usb, miscdev);
+	struct abk_fido_file *ctx = file->private_data;
+	struct abk_fido_usb *usb = ctx->usb;
 	__poll_t mask = EPOLLOUT | EPOLLWRNORM;
 
 	poll_wait(file, &usb->debug_rx.wait, wait);
+	if (abk_fido_file_gone(ctx))
+		return EPOLLHUP | EPOLLERR;
 	if (!abk_fido_queue_empty(&usb->debug_rx))
 		mask |= EPOLLIN | EPOLLRDNORM;
 	return mask;
@@ -4259,6 +4510,8 @@ static __poll_t abk_fido_misc_poll(struct file *file, poll_table *wait)
 
 static const struct file_operations abk_fido_misc_fops = {
 	.owner = THIS_MODULE,
+	.open = abk_fido_misc_open,
+	.release = abk_fido_misc_release,
 	.read = abk_fido_misc_read,
 	.write = abk_fido_misc_write,
 	.poll = abk_fido_misc_poll,
@@ -4380,28 +4633,49 @@ static int abk_fido_setup(struct usb_function *f,
 	return value;
 }
 
-static void abk_fido_disable(struct usb_function *f)
+static void abk_fido_status_worker(struct work_struct *work)
 {
-	struct abk_fido_usb *usb = container_of(f, struct abk_fido_usb, func);
-	struct abk_fido_report stale;
-	unsigned int i;
+	struct abk_fido_usb *usb = container_of(work, struct abk_fido_usb, status_work);
 	unsigned long flags;
+	bool online;
 
-	if (usb->in_ep)
-		usb_ep_disable(usb->in_ep);
-	if (usb->out_ep)
-		usb_ep_disable(usb->out_ep);
-
+	mutex_lock(&abk_fido_dev.lock);
+	if (abk_fido_dev.usb != usb)
+		goto out;
 	spin_lock_irqsave(&usb->tx_lock, flags);
-	usb->tx_pending = false;
-	usb->online = false;
+	online = usb->online && !usb->dead;
 	spin_unlock_irqrestore(&usb->tx_lock, flags);
+	abk_fido_dev.bound = online;
+	if (online)
+		strscpy(abk_fido_dev.udc_name, usb->udc_name,
+			sizeof(abk_fido_dev.udc_name));
+	else
+		abk_fido_dev.udc_name[0] = '\0';
+	abk_fido_set_attach_state_locked("%s_iface:%u",
+					 online ? "online" : "offline", usb->interface_id);
+out:
+	mutex_unlock(&abk_fido_dev.lock);
+}
 
-	/* Drop responses queued for the session that just died: they carry
-	 * stale request state and would poison the next enumeration.
-	 */
-	while (abk_fido_queue_pop(&usb->tx_packets, &stale))
-		;
+static struct usb_request *abk_fido_alloc_request(struct usb_ep *ep)
+{
+	struct usb_request *req = usb_ep_alloc_request(ep, GFP_KERNEL);
+
+	if (!req)
+		return NULL;
+	/* All advertised speeds use exactly 64-byte interrupt packets. */
+	req->buf = kmalloc(ABK_FIDO_REPORT_LEN, GFP_KERNEL);
+	if (!req->buf) {
+		usb_ep_free_request(ep, req);
+		return NULL;
+	}
+	req->length = ABK_FIDO_REPORT_LEN;
+	return req;
+}
+
+static void abk_fido_free_requests(struct abk_fido_usb *usb)
+{
+	unsigned int i;
 
 	if (usb->in_req) {
 		free_ep_req(usb->in_ep, usb->in_req);
@@ -4413,21 +4687,66 @@ static void abk_fido_disable(struct usb_function *f)
 			usb->out_req[i] = NULL;
 		}
 	}
+}
 
-	mutex_lock(&abk_fido_dev.lock);
-	abk_fido_dev.bound = false;
-	abk_fido_dev.udc_name[0] = '\0';
-	mutex_unlock(&abk_fido_dev.lock);
+static void abk_fido_release_endpoints(struct abk_fido_usb *usb)
+{
+	if (usb->in_ep) {
+		usb_ep_autoconfig_release(usb->in_ep);
+		usb->in_ep = NULL;
+	}
+	if (usb->out_ep) {
+		usb_ep_autoconfig_release(usb->out_ep);
+		usb->out_ep = NULL;
+	}
+}
+
+static void abk_fido_disable(struct usb_function *f)
+{
+	struct abk_fido_usb *usb = container_of(f, struct abk_fido_usb, func);
+	struct abk_fido_report stale;
+	unsigned long flags;
+
+	/* May run with IRQs disabled under configfs/composite spinlocks. */
+	spin_lock_irqsave(&usb->tx_lock, flags);
+	WRITE_ONCE(usb->online, false);
+	WRITE_ONCE(usb->generation, usb->generation + 1);
+	usb->cancel_tx = false;
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
+	wake_up_interruptible(&abk_fido_dev.auth_wait);
+	if (usb->in_ep)
+		usb_ep_disable(usb->in_ep);
+	if (usb->out_ep)
+		usb_ep_disable(usb->out_ep);
+
+	spin_lock_irqsave(&usb->tx_lock, flags);
+	usb->tx_pending = false;
+
+	/* Drop responses queued for the session that just died: they carry
+	 * stale request state and would poison the next enumeration.
+	 */
+	while (abk_fido_queue_pop(&usb->tx_packets, &stale))
+		;
+	while (abk_fido_queue_pop(&usb->rx_packets, &stale))
+		;
+	while (abk_fido_queue_pop(&usb->debug_rx, &stale))
+		;
+	schedule_work(&usb->status_work);
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
+	wake_up_interruptible(&usb->debug_rx.wait);
 }
 
 static int abk_fido_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 {
 	struct abk_fido_usb *usb = container_of(f, struct abk_fido_usb, func);
 	struct usb_composite_dev *cdev = f->config->cdev;
-	int i, ret;
+	unsigned long flags;
+	unsigned int i;
+	int ret;
 
-	if (usb->in_req)
-		abk_fido_disable(f);
+	abk_fido_disable(f);
+	if (READ_ONCE(usb->dead))
+		return -ESHUTDOWN;
 
 	ret = config_ep_by_speed(cdev->gadget, f, usb->in_ep);
 	if (ret)
@@ -4445,41 +4764,23 @@ static int abk_fido_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 		goto err_in;
 	usb->out_ep->driver_data = usb;
 
-	usb->in_req = alloc_ep_req(usb->in_ep, ABK_FIDO_REPORT_LEN);
-	if (!usb->in_req) {
-		ret = -ENOMEM;
-		goto err_out;
-	}
-	usb->in_req->complete = abk_fido_tx_complete;
-	usb->in_req->context = usb;
-
+	spin_lock_irqsave(&usb->tx_lock, flags);
+	WRITE_ONCE(usb->online, true);
+	usb->tx_pending = false;
 	for (i = 0; i < ARRAY_SIZE(usb->out_req); i++) {
-		usb->out_req[i] = alloc_ep_req(usb->out_ep, ABK_FIDO_REPORT_LEN);
-		if (!usb->out_req[i]) {
-			ret = -ENOMEM;
+		usb->out_req[i]->length = ABK_FIDO_REPORT_LEN;
+		ret = usb_ep_queue(usb->out_ep, usb->out_req[i], GFP_ATOMIC);
+		if (ret) {
+			spin_unlock_irqrestore(&usb->tx_lock, flags);
 			goto err_out;
 		}
-		usb->out_req[i]->complete = abk_fido_out_complete;
-		usb->out_req[i]->context = usb;
-		usb->out_req[i]->length = ABK_FIDO_REPORT_LEN;
-		ret = usb_ep_queue(usb->out_ep, usb->out_req[i], GFP_KERNEL);
-		if (ret)
-			goto err_out;
 	}
 
 	usb->protocol = HID_REPORT_PROTOCOL;
 	usb->idle = 0;
-	usb->online = true;
-
-	mutex_lock(&abk_fido_dev.lock);
-	abk_fido_dev.bound = true;
-	strscpy(abk_fido_dev.udc_name, cdev->gadget->name,
-		sizeof(abk_fido_dev.udc_name));
-	abk_fido_set_attach_state_locked("online_iface:%u",
-					 (unsigned int)abk_fido_intf_desc.bInterfaceNumber);
-	mutex_unlock(&abk_fido_dev.lock);
-
+	schedule_work(&usb->status_work);
 	abk_fido_tx_kick(usb);
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
 	return 0;
 
 err_out:
@@ -4490,28 +4791,49 @@ err_in:
 	return ret;
 }
 
-static void abk_fido_free_func(struct usb_function *f)
+static void abk_fido_quiesce(struct abk_fido_usb *usb)
 {
-	struct abk_fido_usb *usb = container_of(f, struct abk_fido_usb, func);
+	unsigned long flags;
 
-	cancel_work_sync(&usb->rx_work);
+	/* Only unbind/free_func call this sleepable teardown. A misc fd holds
+	 * its own reference and must stop submitting work before we join it. */
+	spin_lock_irqsave(&usb->tx_lock, flags);
+	WRITE_ONCE(usb->dead, true);
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
+	abk_fido_disable(&usb->func);
 	if (usb->misc_registered) {
 		misc_deregister(&usb->miscdev);
 		usb->misc_registered = false;
 	}
-	kfree(usb);
+	cancel_work_sync(&usb->rx_work);
+	cancel_work_sync(&usb->tx_work);
+	cancel_work_sync(&usb->status_work);
+	mutex_lock(&abk_fido_dev.lock);
+	if (abk_fido_dev.ctap_usb == usb) {
+		abk_fido_dev.ctap_usb = NULL;
+		abk_fido_dev.ctap_cid = 0;
+		abk_fido_dev.ctap_generation = 0;
+		abk_fido_dev.auth_cache_valid = false;
+		abk_fido_clear_assert_state_locked();
+	}
+	mutex_unlock(&abk_fido_dev.lock);
+}
+
+static void abk_fido_free_func(struct usb_function *f)
+{
+	struct abk_fido_usb *usb = container_of(f, struct abk_fido_usb, func);
+
+	abk_fido_quiesce(usb);
+	abk_fido_free_requests(usb);
+	abk_fido_release_endpoints(usb);
+	kref_put(&usb->ref, abk_fido_usb_release);
 }
 
 static void abk_fido_unbind(struct usb_configuration *c, struct usb_function *f)
 {
 	struct abk_fido_usb *usb = container_of(f, struct abk_fido_usb, func);
 
-	if (usb->misc_registered) {
-		misc_deregister(&usb->miscdev);
-		usb->misc_registered = false;
-	}
-	usb_free_all_descriptors(f);
-	cancel_work_sync(&usb->rx_work);
+	abk_fido_quiesce(usb);
 
 	mutex_lock(&abk_fido_dev.lock);
 	if (abk_fido_dev.usb == usb)
@@ -4520,29 +4842,43 @@ static void abk_fido_unbind(struct usb_configuration *c, struct usb_function *f)
 	abk_fido_dev.hid_name[0] = '\0';
 	abk_fido_dev.udc_name[0] = '\0';
 	mutex_unlock(&abk_fido_dev.lock);
+	abk_fido_free_requests(usb);
+	usb_free_all_descriptors(f);
+	abk_fido_release_endpoints(usb);
 }
 
 static int abk_fido_bind(struct usb_configuration *c, struct usb_function *f)
 {
 	struct abk_fido_usb *usb = container_of(f, struct abk_fido_usb, func);
+	unsigned long flags;
+	unsigned int i;
 	int id, ret;
 
 	id = usb_string_ids_tab(c->cdev, abk_fido_strings);
-	if (id < 0)
-		return id;
+	if (id < 0) {
+		ret = id;
+		goto fail;
+	}
 
 	abk_fido_intf_desc.iInterface = abk_fido_strings[ABK_FIDO_STRING_INTERFACE].id;
 	id = usb_interface_id(c, f);
-	if (id < 0)
-		return id;
+	if (id < 0) {
+		ret = id;
+		goto fail;
+	}
 	abk_fido_intf_desc.bInterfaceNumber = id;
+	usb->interface_id = id;
 
 	usb->in_ep = usb_ep_autoconfig(c->cdev->gadget, &abk_fido_fs_in_desc);
-	if (!usb->in_ep)
-		return -ENODEV;
+	if (!usb->in_ep) {
+		ret = -ENODEV;
+		goto fail;
+	}
 	usb->out_ep = usb_ep_autoconfig(c->cdev->gadget, &abk_fido_fs_out_desc);
-	if (!usb->out_ep)
-		return -ENODEV;
+	if (!usb->out_ep) {
+		ret = -ENODEV;
+		goto fail;
+	}
 
 	abk_fido_hs_in_desc.bEndpointAddress = abk_fido_fs_in_desc.bEndpointAddress;
 	abk_fido_hs_out_desc.bEndpointAddress = abk_fido_fs_out_desc.bEndpointAddress;
@@ -4555,17 +4891,39 @@ static int abk_fido_bind(struct usb_configuration *c, struct usb_function *f)
 	ret = usb_assign_descriptors(f, abk_fido_fs_descs, abk_fido_hs_descs,
 				     abk_fido_ss_descs, abk_fido_ss_descs);
 	if (ret)
-		return ret;
+		goto fail;
+
+	/* Requests outlive every disable/set_alt cycle. Only sleepable unbind
+	 * frees them, after callbacks and all transport workers are stopped. */
+	usb->in_req = abk_fido_alloc_request(usb->in_ep);
+	if (!usb->in_req) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+	usb->in_req->complete = abk_fido_tx_complete;
+	usb->in_req->context = usb;
+	for (i = 0; i < ARRAY_SIZE(usb->out_req); i++) {
+		usb->out_req[i] = abk_fido_alloc_request(usb->out_ep);
+		if (!usb->out_req[i]) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+		usb->out_req[i]->complete = abk_fido_out_complete;
+		usb->out_req[i]->context = usb;
+	}
+	spin_lock_irqsave(&usb->tx_lock, flags);
+	WRITE_ONCE(usb->dead, false);
+	WRITE_ONCE(usb->binding_id, usb->binding_id + 1);
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
+	strscpy(usb->udc_name, c->cdev->gadget->name, sizeof(usb->udc_name));
 
 	usb->miscdev.minor = MISC_DYNAMIC_MINOR;
 	usb->miscdev.name = usb->misc_name;
 	usb->miscdev.fops = &abk_fido_misc_fops;
 	usb->miscdev.mode = 0600;
 	ret = misc_register(&usb->miscdev);
-	if (ret) {
-		usb_free_all_descriptors(f);
-		return ret;
-	}
+	if (ret)
+		goto fail;
 	usb->misc_registered = true;
 
 	mutex_lock(&abk_fido_dev.lock);
@@ -4575,6 +4933,12 @@ static int abk_fido_bind(struct usb_configuration *c, struct usb_function *f)
 					 (unsigned int)abk_fido_intf_desc.bInterfaceNumber);
 	mutex_unlock(&abk_fido_dev.lock);
 	return 0;
+fail:
+	WRITE_ONCE(usb->dead, true);
+	abk_fido_free_requests(usb);
+	usb_free_all_descriptors(f);
+	abk_fido_release_endpoints(usb);
+	return ret;
 }
 
 static const struct config_item_type abk_fido_func_type = {
@@ -4623,8 +4987,12 @@ static struct usb_function *abk_fido_alloc(struct usb_function_instance *fi)
 	if (!usb)
 		return ERR_PTR(-ENOMEM);
 
+	kref_init(&usb->ref);
+	usb->dead = true;
 	spin_lock_init(&usb->tx_lock);
 	INIT_WORK(&usb->rx_work, abk_fido_rx_worker);
+	INIT_WORK(&usb->tx_work, abk_fido_tx_worker);
+	INIT_WORK(&usb->status_work, abk_fido_status_worker);
 	abk_fido_queue_init(&usb->rx_packets);
 	abk_fido_queue_init(&usb->debug_rx);
 	abk_fido_queue_init(&usb->tx_packets);
@@ -4701,14 +5069,30 @@ static ssize_t attach_state_show(struct kobject *kobj,
 static ssize_t hid_state_show(struct kobject *kobj,
 			      struct kobj_attribute *attr, char *buf)
 {
-	struct abk_fido_usb *usb = abk_fido_dev.usb;
+	struct abk_fido_usb *usb;
+	unsigned long flags;
+	bool online, pending;
+	unsigned int tx_count, rx_count;
+	ssize_t ret;
 
-	if (!usb)
-		return sysfs_emit(buf, "no_gadget\n");
-	return sysfs_emit(buf,
+	mutex_lock(&abk_fido_dev.lock);
+	usb = abk_fido_dev.usb;
+	if (!usb) {
+		ret = sysfs_emit(buf, "no_gadget\n");
+		goto out;
+	}
+	spin_lock_irqsave(&usb->tx_lock, flags);
+	online = usb->online;
+	pending = usb->tx_pending;
+	tx_count = READ_ONCE(usb->tx_packets.count);
+	rx_count = READ_ONCE(usb->rx_packets.count);
+	spin_unlock_irqrestore(&usb->tx_lock, flags);
+	ret = sysfs_emit(buf,
 			  "online=%u tx_pending=%u tx_q=%u rx_q=%u\n",
-			  usb->online, usb->tx_pending,
-			  usb->tx_packets.count, usb->rx_packets.count);
+			  online, pending, tx_count, rx_count);
+out:
+	mutex_unlock(&abk_fido_dev.lock);
+	return ret;
 }
 
 /* Fixed P-256 keypair, salts and expected outputs for the hmac-secret
@@ -4768,9 +5152,9 @@ static ssize_t hmac_selftest_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
 	struct abk_fido_get_assert_req *req;
-	u8 shared[SHA256_DIGEST_SIZE];
-	u8 outputs[64];
-	u8 tag[ABK_FIDO_HMAC_SALT_AUTH_LEN];
+	u8 shared[SHA256_DIGEST_SIZE] = {};
+	u8 outputs[64] = {};
+	u8 tag[SHA256_DIGEST_SIZE] = {};
 	char *p = buf;
 	ssize_t out_len;
 	int ret = 0;
@@ -4794,7 +5178,7 @@ static ssize_t hmac_selftest_show(struct kobject *kobj,
 
 	ret = abk_fido_hmac_sha256(shared, 32, req->hmac_salt_enc, 64, tag);
 	p += sysfs_emit_at(buf, p - buf, "salt_auth:%s\n", ret ? "FAIL" : "ok");
-	if (ret || memcmp(tag, req->hmac_salt_auth, 16))
+	if (ret || memcmp(tag, req->hmac_salt_auth, ABK_FIDO_HMAC_SALT_AUTH_LEN))
 		goto out;
 
 	ret = abk_fido_aes256_cbc(shared, abk_fido_hmac_zero_iv,
@@ -4827,6 +5211,7 @@ out:
 	kvfree(req);
 	memzero_explicit(shared, sizeof(shared));
 	memzero_explicit(outputs, sizeof(outputs));
+	memzero_explicit(tag, sizeof(tag));
 	return out_len;
 }
 
@@ -5189,6 +5574,7 @@ int abk_fido_key_prepare_config(struct usb_composite_dev *cdev,
 		mutex_unlock(&abk_fido_dev.lock);
 		return PTR_ERR(fi);
 	}
+	container_of(fi, struct abk_fido_opts, func_inst)->auto_attached = true;
 
 	f = usb_get_function(fi);
 	if (IS_ERR(f)) {
@@ -5208,6 +5594,67 @@ int abk_fido_key_prepare_config(struct usb_composite_dev *cdev,
 }
 EXPORT_SYMBOL_GPL(abk_fido_key_prepare_config);
 
+static bool abk_fido_is_auto_function(struct usb_function *f)
+{
+	struct abk_fido_opts *opts;
+
+	if (f->bind != abk_fido_bind || !f->fi)
+		return false;
+	opts = container_of(f->fi, struct abk_fido_opts, func_inst);
+	return opts->auto_attached;
+}
+
+int abk_fido_key_add_config_function(struct usb_configuration *cfg,
+				     struct usb_function *f)
+{
+	struct usb_function_instance *fi;
+	unsigned int next_interface, next_string, i;
+	bool fullspeed, highspeed, superspeed, superspeed_plus;
+	int ret;
+
+	/* Keep configfs' normal failure handling for every explicitly linked
+	 * function, including a manually configured FIDO function.
+	 */
+	if (!abk_fido_is_auto_function(f))
+		return usb_add_function(cfg, f);
+
+	next_interface = cfg->next_interface_id;
+	next_string = cfg->cdev->next_string_id;
+	fullspeed = cfg->fullspeed;
+	highspeed = cfg->highspeed;
+	superspeed = cfg->superspeed;
+	superspeed_plus = cfg->superspeed_plus;
+	ret = usb_add_function(cfg, f);
+	if (!ret)
+		return 0;
+
+	/* usb_add_function() removes a failed bind from the function list and
+	 * clears f->config, but leaves allocated interface/string IDs and speed
+	 * flags behind. The FIDO bind callback unwinds its endpoint claims,
+	 * descriptors and requests. Restore the composite state before dropping
+	 * this optional function so ADB/MTP can still enumerate.
+	 */
+	for (i = next_interface; i < MAX_CONFIG_INTERFACES; i++) {
+		if (cfg->interface[i] == f)
+			cfg->interface[i] = NULL;
+	}
+	cfg->next_interface_id = next_interface;
+	cfg->cdev->next_string_id = next_string;
+	cfg->fullspeed = fullspeed;
+	cfg->highspeed = highspeed;
+	cfg->superspeed = superspeed;
+	cfg->superspeed_plus = superspeed_plus;
+	fi = (struct usb_function_instance *)f->fi;
+	usb_put_function(f);
+	usb_put_function_instance(fi);
+	mutex_lock(&abk_fido_dev.lock);
+	abk_fido_set_attach_state_locked("bind_failed:%d", ret);
+	mutex_unlock(&abk_fido_dev.lock);
+	pr_warn("abk_fido_key: optional USB function skipped after bind failure: %d\n", ret);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(abk_fido_key_add_config_function);
+
 void abk_fido_key_release_config(struct list_head *func_list)
 {
 	struct usb_function *f, *tmp;
@@ -5215,7 +5662,7 @@ void abk_fido_key_release_config(struct list_head *func_list)
 	list_for_each_entry_safe(f, tmp, func_list, list) {
 		struct usb_function_instance *fi;
 
-		if (!f->name || strcmp(f->name, "abk_fido"))
+		if (!abk_fido_is_auto_function(f))
 			continue;
 
 		fi = (struct usb_function_instance *)f->fi;

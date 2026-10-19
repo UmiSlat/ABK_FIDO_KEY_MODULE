@@ -29,6 +29,8 @@ abk_fido_patch_usb_gadget() {
     || abk_die "ABK FIDO configfs patch missing the prepare_config injection"
   grep -q "abk_fido_key_release_config" "$configfs" \
     || abk_die "ABK FIDO configfs patch missing the release_config injection"
+  grep -q "abk_fido_key_add_config_function" "$configfs" \
+    || abk_die "ABK FIDO configfs patch missing optional bind failure isolation"
 }
 
 abk_fido_patch_kernelsu_sepolicy() {

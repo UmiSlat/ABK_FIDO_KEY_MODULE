@@ -107,6 +107,13 @@ assembled.
 
 - Adds one extra FIDO HID interface on top of the existing Android composite
   gadget.
+- If binding the automatically added FIDO interface fails (for example, there
+  are not enough USB endpoints), skips that interface and preserves the
+  original gadget functions such as ADB/MTP. An explicitly configured function
+  retains normal configfs error handling.
+- USB disconnect cancels pending approval and discards packets from the old
+  connection. Debug descriptors opened before gadget unbind cannot access a
+  later binding; reopen `/dev/hidgX` after rebinding.
 - Exposes a misc debug node as `/dev/hidgX` where `X` is usually `0` to `3`.
 - Exposes read-only status nodes under `/sys/kernel/abk_fido_key/`:
   `enabled`, `bound`, `udc`, `hid_dev`, `credential_count`, `last_error`,
@@ -147,7 +154,9 @@ assembled.
 - Local approval is mandatory: nothing that touches a credential is answered
   before the companion app's biometric / screen-lock prompt has been approved,
   and there is no switch that turns that off (`auth_gate_enabled` always reads
-  `1` and refuses a `0`). One approval covers further requests for 3 s; a
+  `1` and refuses a `0`). One approval covers further requests on the same HID
+  channel and connection for 3 s; changing transport, channel or connection
+  invalidates that grant and any assertion continuation. A
   refused, cancelled or unanswered prompt instead blocks every request for 3 s.
   `/sys/kernel/abk_fido_key/auth_cooldown` reports both windows.
 - Silent requests are refused. A `getAssertion` with the `up` option cleared —

@@ -5,12 +5,18 @@ on:
   push:
     paths:
       - files/drivers/abk_fido_key/core.c
+      - files/include/linux/abk_fido_key.h
+      - scripts/patch_configfs_for_abk_fido.py
+      - scripts/abk_fido_setup.sh
       - scripts/patch_kernelsu_sepolicy_for_abk_fido.py
       - tests/**
       - .github/workflows/test-policy-patch.yml
   pull_request:
     paths:
       - files/drivers/abk_fido_key/core.c
+      - files/include/linux/abk_fido_key.h
+      - scripts/patch_configfs_for_abk_fido.py
+      - scripts/abk_fido_setup.sh
       - scripts/patch_kernelsu_sepolicy_for_abk_fido.py
       - tests/**
       - .github/workflows/test-policy-patch.yml

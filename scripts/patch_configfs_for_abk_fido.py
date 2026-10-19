@@ -24,6 +24,14 @@ RELEASE_BLOCK = """static void gadget_config_attr_release(struct config_item *it
 #endif
 \n"""
 
+ADD_FUNCTION_NEEDLE = "\t\t\tret = usb_add_function(c, f);\n"
+ADD_FUNCTION_BLOCK = """#ifdef CONFIG_ABK_FIDO_KEY
+\t\t\tret = abk_fido_key_add_config_function(c, f);
+#else
+\t\t\tret = usb_add_function(c, f);
+#endif
+"""
+
 
 def main() -> int:
     if len(sys.argv) != 2:
@@ -48,6 +56,11 @@ def main() -> int:
         if RELEASE_NEEDLE not in updated:
             raise SystemExit(f"release injection point not found in {path}")
         updated = updated.replace(RELEASE_NEEDLE, RELEASE_BLOCK, 1)
+
+    if "abk_fido_key_add_config_function" not in updated:
+        if updated.count(ADD_FUNCTION_NEEDLE) != 1:
+            raise SystemExit(f"function bind injection point is missing or ambiguous in {path}")
+        updated = updated.replace(ADD_FUNCTION_NEEDLE, ADD_FUNCTION_BLOCK, 1)
 
     if updated != text:
         path.write_text(updated)
