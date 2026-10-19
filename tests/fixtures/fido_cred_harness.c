@@ -4,9 +4,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef long ssize_t;
-typedef long long loff_t;
-typedef unsigned short umode_t;
+/* Host libc may already define these names (notably MinGW's ssize_t). */
+typedef intptr_t fido_test_ssize_t;
+typedef long long fido_test_loff_t;
+typedef unsigned short fido_test_umode_t;
+#define ssize_t fido_test_ssize_t
+#define loff_t fido_test_loff_t
+#define umode_t fido_test_umode_t
 
 #define ERR_PTR(error) ((void *)(intptr_t)(error))
 
